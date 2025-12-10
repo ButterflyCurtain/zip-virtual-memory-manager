@@ -1,0 +1,253 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                                                                              ║
+║                        ZIP Virtual Memory Manager                            ║
+║                              Architecture                                    ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+  The ZIP Virtual Memory Manager (VMM) provides random read/write access to
+  files stored inside a ZIP archive without full decompression.  Writes are
+  buffered in a copy-on-write diff layer and flushed to disk only on an
+  explicit commit().  The source ZIP remains a valid, untouched standard ZIP
+  at all times until commit() completes.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LAYER OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 0 : Caller                                                            │
+│                                                                              │
+│    Any algorithm or process.                                                 │
+│    read(path, offset, len)   write(path, offset, data)   commit()            │
+└────────────────────────────────────┬─────────────────────────────────────────┘
+                                     │  Virtual File I/O API
+                                     ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 1 : Virtual Address Space                                             │
+│                                                                              │
+│   vaddr  0x00000  ┌─────────────────────────────────────────────────────┐   │
+│                   │  file_a.txt   [ pg0 ][ pg1 ][ pg2 ][ pg3 ]          │   │
+│          0x10000  │  dir/file_b   [ pg0 ][ pg1 ][ pg2 ][ pg3 ][ pg4 ]  │   │
+│          0x30000  │  file_c.bin   [ pg0 ][ pg1 ]                        │   │
+│                   └─────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   Each ZIP entry is mapped into a contiguous virtual region, divided into   │
+│   fixed-size pages (default 4 KB, configurable at mount time).               │
+│   Callers address content by (path, byte_offset); the VMM translates to     │
+│   (virtual_page, page_offset) internally.                                    │
+└──────────┬───────────────────────────────────────────┬───────────────────────┘
+           │ read miss                                 │ write
+           ▼                                           ▼
+┌──────────────────────────┐             ┌─────────────────────────────────────┐
+│  LAYER 2a : Page Cache   │             │  LAYER 2b : Diff Layer              │
+│                          │             │                                      │
+│  LRU eviction policy     │             │  Copy-on-Write store                 │
+│  max size = configurable │             │  Pages here are pinned (no evict)   │
+│                          │             │                                      │
+│  [ file_a : pg0 ] ✓ hot  │             │  { file_a : pg1 } ← modified        │
+│  [ file_a : pg1 ] ✓      │  CoW        │  { file_b : pg0 } ← modified        │
+│  [ file_b : pg0 ] ✓ ─────┼────────────▶  { ...           }                  │
+│  [ file_b : pg2 ] ✓      │  on write   │                                      │
+│  [ ...          ]        │             │  Read path checks Diff Layer first,  │
+│                          │             │  falls back to Page Cache.           │
+└──────────┬───────────────┘             └─────────────────────────────────────┘
+           │ cache miss
+           ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 3 : Seek Index  ( archive.zip.vmidx )                                 │
+│                                                                              │
+│   Built on first open.  Stored as a sidecar file alongside archive.zip.     │
+│   Rebuilt only when the source ZIP changes.                                  │
+│                                                                              │
+│   entry: file_b                                                              │
+│   compressed_stream:                                                         │
+│   [════════════════════════════════════════════════════════════════════]     │
+│    ↑         ↑         ↑         ↑         ↑         ↑         ↑            │
+│   CP0       CP1       CP2       CP3       CP4       CP5       CP6            │
+│   0 MB      1 MB      2 MB      3 MB      4 MB      5 MB      6 MB           │
+│                                                                              │
+│   Each checkpoint stores:                                                    │
+│     - compressed_offset   : byte position in the DEFLATE stream              │
+│     - uncompressed_offset : corresponding byte in expanded output            │
+│     - decoder_state       : DEFLATE sliding window snapshot (32 KB)          │
+│                                                                              │
+│   Random access to uncompressed offset X:                                    │
+│     1. Find nearest CP where CP.uncompressed_offset ≤ X                      │
+│     2. Restore decoder state from that CP                                    │
+│     3. Decompress forward ( X − CP.uncompressed_offset ) bytes only          │
+│     → Worst case: 1 MB of sequential decode, never a full-file decode.      │
+└──────────────────────────────┬───────────────────────────────────────────────┘
+                               │ seek + partial decode
+                               ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 4 : Source ZIP  ( archive.zip )                                       │
+│                                                                              │
+│   ┌──────────────┬──────────────────────────────┬─────────────────────┐     │
+│   │ Local Header │     DEFLATE stream            │   Central Directory │     │
+│   │  file_a.txt  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │                     │     │
+│   │  dir/file_b  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │   entry table       │     │
+│   │  file_c.bin  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │                     │     │
+│   └──────────────┴──────────────────────────────┴─────────────────────┘     │
+│                                                                              │
+│   Read-only at all times until commit() is explicitly called.                │
+│   Fully valid as a standard ZIP; any third-party tool can open it.           │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  READ PATH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  read(path, offset, len)
+       │
+       ├─ Diff Layer (Tier 1 hot store): page present?
+       │       YES → return page data
+       │
+       ├─ Diff Layer (Tier 2 spill file, .vmdirty): page present?
+       │       YES → return page data
+       │
+       ├─ Page Cache: page present?
+       │       YES → return page data
+       │
+       └─ Seek Index + Source ZIP:
+               locate nearest checkpoint ≤ target page
+               decompress forward to target page
+               populate Page Cache
+               return page data
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  WRITE PATH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  write(path, offset, data)
+       │
+       ├─ Page already in Diff Layer Tier 1?
+       │       YES → update data in-place, re-stamp as newest
+       │
+       ├─ Page already in Diff Layer Tier 2?
+       │       YES → append new DATA RECORD to .vmdirty (supersedes prior)
+       │
+       └─ Page not yet dirty:
+               load from Page Cache or Source ZIP (copy-on-write)
+               apply write
+               insert into Diff Layer Tier 1
+               if dirty_current + page_size > dirty_limit → trigger Spill
+
+  Source ZIP is never written during the write path.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  commit() FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  commit() called
+       │
+       ├─ flush() : spill all Tier 1 pages → write COMMIT MARKER → fdatasync()
+       │
+       ├─ For each entry in ZIP:
+       │       │
+       │       ├─ [no modified pages in Diff Layer]
+       │       │       └─→ copy compressed block verbatim from source ZIP
+       │       │               ( zero recompression cost )
+       │       │
+       │       └─ [modified pages present in Diff Layer]
+       │               └─→ recompress that entry only
+       │                       ( cost ∝ size of that entry, not whole archive )
+       │
+       ├─ Write result to  archive.new.zip
+       │
+       ├─ rename( archive.new.zip → archive.zip )       ← POSIX atomic
+       │       Crash before rename : source ZIP survives intact
+       │       Crash after  rename : new ZIP is complete and valid
+       │
+       ├─ Update archive.zip.vmidx for modified entries only
+       │
+       └─ Delete archive.zip.vmdirty
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  flush() SEMANTICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  flush() is a durable checkpoint of the spill journal, independent of commit().
+  After flush() returns (STRICT mode), all dirty pages are durable on disk and
+  recoverable across a crash via recover_committed().
+
+  commit() calls flush() as its first step.
+  An application may call flush() independently to establish intermediate
+  recovery points without committing changes to the source ZIP.
+
+  Two flush modes (configured at mount time):
+
+    STRICT (default)
+        All Tier 1 dirty pages are spilled to .vmdirty before the COMMIT
+        MARKER is written.  fdatasync() is called.  Crash after flush()
+        → full recovery guaranteed.
+
+    LAZY  ( --lazy-flush )
+        COMMIT MARKER is written for currently-spilled pages only.
+        Tier 1 pages not yet spilled are not covered by the marker.
+        Crash between a LAZY flush() and commit() may lose those pages.
+        Suitable when the application will retry any lost writes.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FIRST-OPEN INITIALIZATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  One-time cost per ZIP file.  Subsequent opens load the index in milliseconds.
+
+  open( archive.zip )
+       │
+       ├─ archive.zip.vmidx present and fingerprint valid?
+       │       YES → load index, mount immediately
+       │       NO  → run DEFLATE Stream Walker  ( single linear pass )
+       │                   │
+       │                   │  For each DEFLATE entry:
+       │                   │    Walk stream sequentially from start.
+       │                   │    Every 1 MB of uncompressed output:
+       │                   │      snapshot decoder state → write checkpoint
+       │                   │
+       │                   └─→ Write archive.zip.vmidx
+       │                         ( source ZIP is not modified )
+       │
+       ├─ archive.zip.vmdirty present?
+       │       YES → run recovery protocol (see vmdirty Journal Specification)
+       │       NO  → proceed
+       │
+       └─ Mount virtual address space
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SIDECAR FILES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  All sidecar files live alongside the source archive.
+
+  archive.zip                   source ZIP (read-only until commit)
+  archive.zip.vmidx             seek index (rebuilt if absent or stale)
+  archive.zip.vmdirty           spill journal (present only during dirty session)
+  archive.zip.vmdirty.bak.{id}  recovered spill journal (retained for forensics)
+
+  Moving archive.zip to another location requires moving all sidecar files
+  with it to preserve fast-access and recovery capabilities.  A ZIP without
+  its .vmidx is still a valid ZIP; first-open rebuilds the index.  A ZIP
+  without its .vmdirty means any unrecovered dirty pages from a prior session
+  are lost; the source ZIP itself remains intact.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  COMPATIBILITY MATRIX
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Scenario                                           Result
+  ─────────────────────────────────────────────────────────────────────────────
+  Open with VMM, .vmidx present and valid           fast random access
+  Open with VMM, .vmidx absent or stale             slow first-open, then fast
+  Open with standard unzip / 7-Zip / WinZip         works perfectly (.vmidx ignored)
+  Copy archive.zip without .vmidx to another host   works as a normal ZIP
+  archive.zip modified externally                   .vmidx invalidated; rebuilt on next open

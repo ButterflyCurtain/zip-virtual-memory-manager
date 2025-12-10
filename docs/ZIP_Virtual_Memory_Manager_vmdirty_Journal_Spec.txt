@@ -1,0 +1,704 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                                                                              ║
+║                        ZIP Virtual Memory Manager                            ║
+║                      .vmdirty Journal Specification                          ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+  The .vmdirty file is an append-only binary journal that durably stores dirty
+  pages spilled from the Diff Layer Tier 1 (in-memory) to Tier 2 (on-disk).
+  It survives process crashes and provides the VMM with a complete, verifiable
+  recovery basis.
+
+  Design requirements addressed by this format:
+
+    - Torn write detection: a crash mid-record must not produce an
+      undetectable partial record.  Each record carries a length field and
+      a trailing CRC so partial writes are identified precisely.
+
+    - Per-record integrity: corruption anywhere in the file (not only at
+      the tail) is detected by per-record CRC validation.
+
+    - Commit boundaries: the file distinguishes pages that were explicitly
+      checkpointed (durable) from pages that were in-flight at crash time.
+      COMMIT MARKERs establish these boundaries.
+
+    - Session identity: each record carries a generation ID so that spill
+      files left by a prior mount session are unambiguously identified and
+      not confused with the current session.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 1 : Binary Format
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  All multi-byte integers are little-endian.
+  All offsets are byte offsets from the start of the file.
+
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  FILE HEADER  ( fixed 80 bytes, offset 0 )                               │
+  │                                                                          │
+  │  offset  size  field                  notes                              │
+  │  ──────  ────  ─────────────────────  ─────────────────────────────────  │
+  │   0      8     magic                  "VMDIRTY\0"                        │
+  │                                       0x56 4D 44 49 52 54 59 00          │
+  │   8      2     format_version         0x0001                             │
+  │  10      2     flags                  see FLAG BITS below                │
+  │  12      8     generation_id          see GENERATION ID below            │
+  │  20      8     source_file_size       stat().st_size of archive.zip      │
+  │  28      8     source_inode           stat().st_ino of archive.zip       │
+  │  36     20     source_cd_hash         SHA-1 of Central Directory block   │
+  │  56      8     created_at_ns          wall-clock ns; informational only  │
+  │  64      4     page_size              bytes per page (e.g. 4096)         │
+  │  68      4     reserved               0x00000000                         │
+  │  72      4     header_crc32           CRC-32C of bytes [0 .. 71]         │
+  │  76      4     padding                0x00000000                         │
+  │                                                                          │
+  │  Total: 80 bytes                                                         │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  FLAG BITS  ( flags field, 16 bits )
+
+    bit 0   STRICT_FINGERPRINT    file was opened with --strict-fingerprint
+    bit 1   SPILL_ONLY            mount was configured dirty_limit=0
+    bit 2   RECOVERY_PENDING      set when a prior session crashed mid-commit;
+                                  cleared when recovery completes
+    bits 3–15  reserved; must be 0
+
+  GENERATION ID  ( 8 bytes )
+
+    Layout:  [ 48-bit timestamp_ns_truncated ][ 16-bit crypto_random ]
+
+    The 48-bit portion is the lower 48 bits of a POSIX monotonic or
+    real-time clock reading taken at mount time.  The 16-bit portion is
+    drawn from a cryptographically secure random source.  The combined
+    value identifies a single mount session.  It is not a sequence number;
+    it does not increment across sessions.
+
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  DATA RECORD  ( variable length )                                        │
+  │                                                                          │
+  │  offset  size  field                  notes                              │
+  │  ──────  ────  ─────────────────────  ─────────────────────────────────  │
+  │   0      4     record_magic           0xD1A5EC0D                         │
+  │   4      8     generation_id          must equal header.generation_id    │
+  │  12      8     sequence_num           monotonically increasing, 1-based  │
+  │  20      2     entry_name_len         byte length of entry_name (N)      │
+  │  22      N     entry_name             UTF-8 ZIP entry path, no NUL       │
+  │  22+N    8     page_index             0-based page index within entry    │
+  │  30+N    4     data_len               equals header.page_size, except    │
+  │                                       for the last page of an entry      │
+  │                                       which may be smaller               │
+  │  34+N    D     data                   raw uncompressed page bytes        │
+  │                                       ( D = data_len )                   │
+  │  34+N+D  4     record_crc32           CRC-32C of bytes [0 .. 33+N+D]    │
+  │                                       covering record_magic through data  │
+  │                                                                          │
+  │  Total: 38 + N + D  bytes                                                │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  COMMIT MARKER  ( fixed 32 bytes )                                       │
+  │                                                                          │
+  │  offset  size  field                  notes                              │
+  │  ──────  ────  ─────────────────────  ─────────────────────────────────  │
+  │   0      4     marker_magic           0xC0FFEE42                         │
+  │   4      8     generation_id          must equal header.generation_id    │
+  │  12      8     commit_sequence        sequence_num of the last DATA      │
+  │                                       RECORD included in this commit     │
+  │  20      8     page_count             total dirty page count at this     │
+  │                                       commit boundary                    │
+  │  28      4     marker_crc32           CRC-32C of bytes [0 .. 27]         │
+  │                                                                          │
+  │  Total: 32 bytes                                                         │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  CRC algorithm:
+
+    CRC-32C (Castagnoli) is used for all CRC fields.
+    Rationale: hardware-accelerated on x86 (SSE4.2 PCRC32) and ARM (CRC32
+    extension); sub-microsecond on a 4 KB page on modern CPUs.  Better
+    Hamming distance than CRC-32/ISO for short payloads.  Same polynomial
+    used by iSCSI, SCTP, Btrfs, and ZFS for storage integrity.
+
+
+  FILE STRUCTURE — complete view:
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  [ FILE HEADER           ]   80 bytes, always present                   │
+  │  [ DATA RECORD  seq=1    ]   first spilled page                         │
+  │  [ DATA RECORD  seq=2    ]                                               │
+  │  [ DATA RECORD  seq=3    ]                                               │
+  │  [ COMMIT MARKER         ]   logical checkpoint after seq=3             │
+  │  [ DATA RECORD  seq=4    ]                                               │
+  │  [ DATA RECORD  seq=5    ]                                               │
+  │  [ DATA RECORD  seq=6    ]   ← process crashed here (partial write)     │
+  │   ~~~~ EOF (file truncated mid-record) ~~~~                             │
+  │                                                                          │
+  │  On recovery:                                                            │
+  │    seq 1–3  : fully valid, commit marker present → committed_pages      │
+  │    seq 4–5  : valid records, past last commit marker → uncommitted       │
+  │    seq 6    : partial write detected by CRC → discarded                 │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 2 : Recovery Read Algorithm
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Executed once at open() when a .vmdirty file is found.
+
+  ─────────────────────────────────────────────────────────────────────────────
+  function read_vmdirty(path) -> RecoveryResult:
+
+    f = open(path, O_RDONLY)
+
+    ── STEP 1: Validate header ──────────────────────────────────────────────
+    hdr = f.read(80)
+    if len(hdr) < 80:
+        return RecoveryResult(status=HEADER_TRUNCATED)
+    if hdr[0:8] != b"VMDIRTY\0":
+        return RecoveryResult(status=HEADER_MAGIC_BAD)
+    if crc32c(hdr[0:72]) != uint32_le(hdr[72:76]):
+        return RecoveryResult(status=HEADER_CRC_BAD)
+
+    gen_id        = uint64_le(hdr[12:20])
+    page_size     = uint32_le(hdr[64:68])
+    format_ver    = uint16_le(hdr[8:10])
+    if format_ver > SUPPORTED_VERSION:
+        return RecoveryResult(status=VERSION_UNSUPPORTED)
+
+    ── STEP 2: Walk records ─────────────────────────────────────────────────
+    valid_records    = []
+    last_commit_seq  = 0          # 0 = no commit marker seen
+    truncation_point = None       # byte offset where truncation was detected
+
+    pos = 80
+    while True:
+        magic_buf = f.read(4)
+        if len(magic_buf) == 0:
+            break                 # clean EOF
+
+        if len(magic_buf) < 4:
+            truncation_point = pos
+            break
+
+        magic = uint32_le(magic_buf)
+
+        ── DATA RECORD ──────────────────────────────────────────────────────
+        if magic == 0xD1A5EC0D:
+            fixed = f.read(18)
+            if len(fixed) < 18:
+                truncation_point = pos
+                break
+
+            record_gen  = uint64_le(fixed[0:8])
+            seq_num     = uint64_le(fixed[8:16])
+            name_len    = uint16_le(fixed[16:18])
+
+            if record_gen != gen_id:
+                truncation_point = pos
+                break
+
+            name_and_rest = f.read(name_len + 8 + 4)
+            if len(name_and_rest) < name_len + 12:
+                truncation_point = pos
+                break
+
+            entry_name = name_and_rest[0:name_len].decode('utf-8', errors='replace')
+            page_index = uint64_le(name_and_rest[name_len:name_len+8])
+            data_len   = uint32_le(name_and_rest[name_len+8:name_len+12])
+
+            if data_len > page_size:
+                truncation_point = pos
+                break
+
+            data = f.read(data_len)
+            if len(data) < data_len:
+                truncation_point = pos
+                break
+
+            crc_buf = f.read(4)
+            if len(crc_buf) < 4:
+                truncation_point = pos
+                break
+
+            covered = (magic_buf + fixed + name_and_rest + data)
+            if crc32c(covered) != uint32_le(crc_buf):
+                truncation_point = pos
+                break
+
+            valid_records.append(DirtyPage(
+                entry_name = entry_name,
+                page_index = page_index,
+                data       = data,
+                sequence   = seq_num,
+            ))
+            pos = f.tell()
+
+        ── COMMIT MARKER ────────────────────────────────────────────────────
+        elif magic == 0xC0FFEE42:
+            rest = f.read(28)
+            if len(rest) < 28:
+                truncation_point = pos
+                break
+
+            marker_gen    = uint64_le(rest[0:8])
+            commit_seq    = uint64_le(rest[8:16])
+            covered       = magic_buf + rest[0:24]
+            expected_crc  = uint32_le(rest[24:28])
+
+            if marker_gen != gen_id or crc32c(covered) != expected_crc:
+                truncation_point = pos
+                break
+
+            last_commit_seq = commit_seq
+            pos = f.tell()
+
+        ── UNKNOWN MAGIC ────────────────────────────────────────────────────
+        else:
+            truncation_point = pos
+            break
+
+    ── STEP 3: Classify result ──────────────────────────────────────────────
+    committed_pages   = [r for r in valid_records if r.sequence <= last_commit_seq]
+    uncommitted_pages = [r for r in valid_records if r.sequence >  last_commit_seq]
+
+    return RecoveryResult(
+        status             = OK,
+        generation_id      = gen_id,
+        committed_pages    = committed_pages,
+        uncommitted_pages  = uncommitted_pages,
+        last_commit_seq    = last_commit_seq,
+        truncation_point   = truncation_point,
+        valid_through_seq  = valid_records[-1].sequence if valid_records else 0,
+    )
+  ─────────────────────────────────────────────────────────────────────────────
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 3 : Recovery Protocol — Caller API and Decision Tree
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The VMM surfaces a RecoveryResult to the caller.  Data-safety decisions
+  remain with the caller; the VMM does not auto-resolve.
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  RecoveryResult fields                                                   │
+  │                                                                          │
+  │  status             OK | HEADER_TRUNCATED | HEADER_MAGIC_BAD |          │
+  │                     HEADER_CRC_BAD | VERSION_UNSUPPORTED                 │
+  │  generation_id      identifies the mount session that wrote this file    │
+  │  committed_pages    pages whose sequence ≤ last commit marker            │
+  │  uncommitted_pages  pages whose sequence > last commit marker            │
+  │  last_commit_seq    0 if no commit marker was ever written               │
+  │  truncation_point   byte offset of detected truncation; None if clean   │
+  │  valid_through_seq  highest sequence number that passed CRC validation   │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Caller resolution options                                               │
+  │                                                                          │
+  │  recover_committed()                                                     │
+  │    Restore only committed_pages into Tier 1.                             │
+  │    Discard uncommitted_pages.                                            │
+  │    Safe for any automated recovery.                                      │
+  │                                                                          │
+  │  recover_all()                                                           │
+  │    Restore committed_pages + uncommitted_pages into Tier 1.              │
+  │    Caller accepts that uncommitted pages may represent partial state.    │
+  │    Suitable for single-writer applications with no logical transaction   │
+  │    boundary.                                                             │
+  │                                                                          │
+  │  discard()                                                               │
+  │    Delete .vmdirty.  All dirty pages are lost.                           │
+  │    Mount proceeds clean.                                                 │
+  │    Suitable for read-only use cases or when caller can regenerate.       │
+  │                                                                          │
+  │  abort()                                                                 │
+  │    Leave .vmdirty on disk untouched.  Do not mount.                     │
+  │    Suitable for manual inspection before a decision is made.             │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Decision tree presented to caller at open():
+
+  open( archive.zip )
+       │
+       ├─ .vmdirty absent → mount CLEAN
+       │
+       └─ .vmdirty present
+               │
+               ├─ fingerprint check: source ZIP changed while dirty pages exist?
+               │       YES → CONFLICT state
+               │               offer: discard_dirty() | abort()
+               │       NO  → run read_vmdirty()
+               │
+               └─ RecoveryResult.status
+                       │
+                       ├─ HEADER_TRUNCATED | HEADER_MAGIC_BAD | HEADER_CRC_BAD
+                       │       file unreadable
+                       │       offer: discard() | abort()
+                       │
+                       ├─ VERSION_UNSUPPORTED
+                       │       upgrade required
+                       │       offer: abort()
+                       │
+                       └─ OK
+                               │
+                               ├─ last_commit_seq == 0
+                               │    AND committed_pages empty
+                               │    AND uncommitted_pages empty
+                               │       → stale empty file → silently discard()
+                               │
+                               ├─ last_commit_seq == 0
+                               │    AND uncommitted_pages non-empty
+                               │       → no checkpoint was written
+                               │       → offer: recover_all() | discard() | abort()
+                               │
+                               ├─ last_commit_seq > 0
+                               │    AND uncommitted_pages empty
+                               │       → clean crash with commit boundary
+                               │       → auto: recover_committed()  ← safe default
+                               │
+                               └─ last_commit_seq > 0
+                                   AND uncommitted_pages non-empty
+                                       → in-flight work exists past last checkpoint
+                                       → offer: recover_committed()
+                                               | recover_all()
+                                               | discard()
+                                               | abort()
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 4 : Write Path
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  4.1  When a DATA RECORD is written
+
+  A DATA RECORD is appended exactly when a dirty page is evicted from
+  Tier 1 to Tier 2.
+
+  Trigger condition:
+      dirty_current + incoming_page_size > dirty_limit
+
+  Write procedure:
+
+    a. Select victim pages per spill policy (see Section 5).
+    b. For each victim page:
+         i.   Build DATA RECORD in a write buffer.
+         ii.  Compute CRC-32C over the buffer (excluding the crc field).
+         iii. Append CRC to buffer.
+         iv.  Write buffer to .vmdirty with a single write() call.
+              ( Single call minimizes the torn-write window. )
+    c. Remove victim page from Tier 1.  Decrease dirty_current.
+    d. Update the in-memory Tier 2 index:
+         (entry_name, page_index) → byte_offset_in_vmdirty
+
+  fsync policy:
+
+    Default (--sync-spill):
+        .vmdirty is opened with O_DSYNC.
+        Each write is durable before returning.
+
+    Fast mode (--lazy-spill):
+        Records are buffered in OS page cache.
+        fdatasync() is called only when a COMMIT MARKER is written.
+        Crash between a spill and the next commit marker loses in-flight
+        pages.  Acceptable when the application will retry lost writes.
+
+  Write hit on a page already in Tier 1:
+      Update data in-place.
+      Re-stamp as newest (move to back of FIFO deque).
+      dirty_current is unchanged.
+
+  Write hit on a page already in Tier 2:
+      Append a new DATA RECORD to .vmdirty (higher sequence_num).
+      The new record supersedes the prior one for recovery purposes.
+      The page is not moved back to Tier 1.
+
+
+  4.2  When a COMMIT MARKER is written
+
+  A COMMIT MARKER is written when the application calls flush().
+
+  flush() procedure (STRICT mode, default):
+
+    a. Spill all Tier 1 pages that exceed dirty_limit.
+    b. Spill all remaining Tier 1 pages.
+    c. Build COMMIT MARKER with commit_sequence = highest sequence_num.
+    d. Write to .vmdirty.
+    e. fdatasync().
+    f. Update in-memory last_commit_seq.
+
+  After flush() returns (STRICT), a crash is recoverable via
+  recover_committed(), which restores the full dirty state as of this call.
+
+  flush() (LAZY mode, --lazy-flush):
+
+    Steps a and b are omitted.  The COMMIT MARKER covers only pages
+    already in Tier 2 at the time of the call.  Tier 1 pages not yet
+    spilled are not covered.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 5 : Spill Policy
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  5.1  FIFO Spill Policy (default)
+
+  When dirty_limit is exceeded, the oldest-written dirty pages are spilled
+  first.  Rationale: recently-written pages exhibit higher temporal locality
+  of re-mutation; preserving them in Tier 1 reduces write amplification in
+  common workloads.  The policy is also the simplest correct implementation,
+  with no per-page metadata beyond write time.
+
+  Tier 1 data structure:
+
+    Doubly-linked list (insertion order) + hash map for O(1) lookup.
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  insertion_order (deque):                                            │
+    │    OLDEST ──→ [ file_a:pg0 ][ file_b:pg12 ][ file_c:pg0 ] ──→ NEWEST│
+    │                                                                      │
+    │  index (HashMap):                                                    │
+    │    (file_a, 0)  → &node                                              │
+    │    (file_b, 12) → &node                                              │
+    │    (file_c, 0)  → &node                                              │
+    └──────────────────────────────────────────────────────────────────────┘
+
+  Spill selection:
+
+      while dirty_current + incoming > dirty_limit:
+          victim = insertion_order.pop_front()    // oldest
+          write DATA RECORD to .vmdirty
+          remove from index
+          dirty_current -= page_size
+
+  Write hit on a Tier 1 page:
+
+      Update data in-place.
+      Move node to back of insertion_order (re-stamp as newest).
+      dirty_current is unchanged.
+
+  Write hit on a Tier 2 page:
+
+      Append new DATA RECORD (higher sequence_num) to .vmdirty.
+      New record supersedes old one for recovery.
+      Page remains in Tier 2; it is not moved back to Tier 1.
+
+  Known write amplification case:
+
+    1. Write page A  → A is the oldest dirty page
+    2. Write 63 other pages → fills Tier 1 near dirty_limit
+    3. Write one more page  → pressure → FIFO spills A to Tier 2
+    4. Write page A again   → appends another DATA RECORD to .vmdirty
+
+    A temperature-aware policy would detect A as hot and spare it from
+    spill.  This is a correctness-neutral trade-off; the FIFO policy
+    accepts higher write amplification in exchange for implementation
+    simplicity.
+
+
+  5.2  Temperature-Aware Spill Policies (optional, mount-time selection)
+
+  The .vmdirty format is policy-agnostic.  Only the victim selection
+  algorithm in Tier 1 changes.  No format migration is required.
+
+  LRU policy:
+
+    Replace the insertion_order deque with an LRU list maintained by
+    both write time and read time.  On each page access (read or write),
+    move the node to the back (most-recently-used).  Spill selects from
+    the front (least-recently-used dirty page).
+
+  Clock-hand policy (lower overhead than strict LRU):
+
+    Each dirty page carries a reference bit (ref_bit = 0 initially).
+    A logical clock hand sweeps Tier 1 during spill selection:
+        if ref_bit == 1: clear ref_bit, advance hand
+        if ref_bit == 0: this page is the spill victim
+    On any access to the page: ref_bit = 1.
+
+  Mount options:
+
+    mount(path, spill_policy=FIFO)    // default
+    mount(path, spill_policy=LRU)
+    mount(path, spill_policy=CLOCK)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 6 : Generation ID and Session Provenance
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  A .vmdirty file left on disk by a prior mount session must be
+  distinguishable from one written by the current session.  This matters
+  especially on network-mounted filesystems where multiple hosts may share
+  the same archive path.
+
+  Provenance check on open():
+
+    The VMM does NOT compare generation IDs for equality between sessions.
+    A .vmdirty from a prior session always has a different generation ID;
+    this is expected.  The relevant check is source fingerprint:
+
+        .vmdirty.header.source_file_size == stat(archive.zip).st_size
+        AND
+        .vmdirty.header.source_inode     == stat(archive.zip).st_ino
+        AND
+        .vmdirty.header.source_cd_hash   == current cd_hash
+
+    Fingerprint matches → .vmdirty is from a prior mount of THIS archive.
+        The generation_id identifies which prior session.  Proceed with
+        the recovery protocol.
+
+    Fingerprint mismatches → .vmdirty is stale (source changed).
+        CONFLICT state.  Caller must resolve.
+
+  Recovery and session transition:
+
+    On a fresh mount after recovery:
+        old .vmdirty → rename to .vmdirty.bak.{generation_id}
+        new .vmdirty → created with a new generation_id
+        .vmdirty.bak.* → retained for forensics; not used by the VMM
+
+    Each DATA RECORD carries the generation_id from the file header.
+    A generation_id mismatch within a record terminates record walking
+    at that point (detected as corruption, not as a valid prior session).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 7 : Component Interfaces
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  VmdirtyWriter
+
+    createFile(path, fingerprint, generation_id, page_size)
+        Writes FILE HEADER with CRC.  Opens file with O_DSYNC (default)
+        or buffered (--lazy-spill).
+
+    appendRecord(entry_name, page_index, data) → sequence_num
+        Builds DATA RECORD, computes CRC-32C, writes atomically.
+
+    appendCommitMarker(commit_sequence)
+        Writes COMMIT MARKER, calls fdatasync().
+
+    close()
+
+
+  VmdirtyReader
+
+    readAll(path) → RecoveryResult
+        Validates header.  Walks records.  Classifies committed and
+        uncommitted pages.  Returns RecoveryResult as described in
+        Section 3.
+
+
+  Tier1DirtyStore
+
+    write(entry_name, page_index, data)
+        Checks dirty_limit.  Triggers spill via VmdirtyWriter if exceeded.
+        Updates FIFO deque and index.
+
+    read(entry_name, page_index) → Optional<bytes>
+        Checks Tier 1 first; falls back to VmdirtyIndex for Tier 2.
+
+    spill(n_pages)
+        FIFO victim selection.  Delegates writes to VmdirtyWriter.
+
+
+  VmdirtyIndex  ( in-memory only )
+
+    Populated at mount from an existing .vmdirty when present.
+    Maps (entry_name, page_index) → byte_offset_in_vmdirty.
+    Used by the Tier 2 read path.
+    Rebuilt entirely from .vmdirty on recovery; never persisted separately.
+
+
+  VmmMount
+
+    open(path, options)
+        Runs fingerprint validation.
+        Runs VmdirtyReader if .vmdirty is present.
+        Routes to recovery decision tree.
+        Exposes RecoveryResult to caller.
+
+    RecoveryHandler interface
+        onRecovery(RecoveryResult) → RecoveryDecision
+            { RECOVER_COMMITTED | RECOVER_ALL | DISCARD | ABORT }
+
+    applyRecovery(decision, result)
+        Loads committed_pages (and optionally uncommitted_pages) into Tier 1.
+        Renames old .vmdirty to .vmdirty.bak.{generation_id}.
+        Creates new .vmdirty for the current session.
+
+    flush()
+        STRICT: spill all Tier 1 pages → appendCommitMarker() → fdatasync()
+        LAZY:   appendCommitMarker() for currently-spilled pages only
+
+    commit()
+        Calls flush() (STRICT).
+        Proceeds with recompress → write archive.new.zip → rename().
+        On success: deletes .vmdirty; updates .vmidx for modified entries.
+        On failure before rename: .vmdirty remains; recovery path is intact.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 8 : Invariants and Safety Properties
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The following invariants must hold at all times.  Any violation is a VMM
+  bug, not a recoverable runtime condition.
+
+  I-1  Source ZIP is read-only until commit().
+         archive.zip is never opened with write intent until commit() begins.
+
+  I-2  Dirty pages are never silently discarded.
+         A page in Tier 1 or Tier 2 is removed only by:
+           (a) commit()             — page written to new ZIP
+           (b) discard()           — explicit caller decision
+           (c) recover_committed() / recover_all() — recovery decision
+         It is never removed by LRU eviction, OOM killer, or any implicit path.
+
+  I-3  .vmdirty grows monotonically within a session.
+         Records are only appended, never overwritten in place.
+         Exception: the header flags field may be updated in place for the
+         RECOVERY_PENDING bit (single aligned write; safe on all platforms).
+
+  I-4  A COMMIT MARKER sequence number is always ≥ the previous commit
+         sequence.  Commit markers are never written out of order.
+
+  I-5  sequence_num is strictly monotonically increasing per generation.
+         No two DATA RECORDs in the same .vmdirty file share a sequence_num.
+
+  I-6  The in-memory VmdirtyIndex is always consistent with .vmdirty on disk.
+         If a record was appended to disk, it is present in the index or
+         superseded by a newer record for the same page.
+
+  I-7  After flush() returns (STRICT mode), all dirty pages are durable.
+         A crash after flush() is fully recoverable via recover_committed().
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 9 : Sidecar File Naming and Co-location Rules
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  archive.zip                       source ZIP (read-only until commit)
+  archive.zip.vmidx                 seek index (rebuilt if absent or stale)
+  archive.zip.vmdirty               spill journal (current session)
+  archive.zip.vmdirty.bak.{gen_id}  recovered journal (forensics retention)
+
+  If archive.zip is moved, all sidecar files must move with it.
+
+  A ZIP without its .vmidx is still a valid ZIP; first-open rebuilds the index.
+
+  A ZIP without its .vmdirty means dirty pages from a prior session are lost.
+  The source ZIP itself is unaffected.
+
+  On commit() success:
+    .vmdirty is deleted.
+    .vmidx is updated for modified entries only.
+    .vmdirty.bak.* files are retained for a configurable period
+    (default: 24 hours, or deleted at next clean mount).

@@ -1,0 +1,208 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                                                                              ║
+║                        ZIP Virtual Memory Manager                            ║
+║                    Diff Layer Pressure  /  Integrity Detection               ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 1 : Diff Layer  —  Dirty Page Lifecycle
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Dirty pages are never silently discarded.  They are held in one of two
+  tiers at all times until commit() or an explicit discard() call.
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Diff Layer — Tier 1 : Hot Dirty Store  ( in-memory )                   │
+  │                                                                          │
+  │   dirty_limit   = 256 MB  ( default; configurable per mount )            │
+  │   dirty_current = Σ sizeof(modified pages currently in Tier 1)          │
+  │                                                                          │
+  │   [ pg: file_a:0  ] dirty  4 KB                                         │
+  │   [ pg: file_b:12 ] dirty  4 KB                                         │
+  │   [ pg: file_c:0  ] dirty  4 KB    dirty_current = N × 4 KB             │
+  │   [ ...           ] ...                                                  │
+  │                                                                          │
+  │   write(path, offset, data)                                              │
+  │        │                                                                 │
+  │        ├─ dirty_current + page_size ≤ dirty_limit                        │
+  │        │       └─→ store in Tier 1, return immediately                   │
+  │        │                                                                 │
+  │        └─ dirty_current + page_size  >  dirty_limit   ← PRESSURE POINT  │
+  │                └─→ trigger Spill                                          │
+  └──────────────────────────────────┬──────────────────────────────────────┘
+                                     │  spill triggered
+                                     ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Diff Layer — Tier 2 : Spill File  ( on-disk )                          │
+  │                                                                          │
+  │   path :   archive.zip.vmdirty  ( alongside .vmidx )                    │
+  │   format : append-only journal of DATA RECORDs and COMMIT MARKERs       │
+  │            ( see vmdirty Journal Specification for binary layout )       │
+  │                                                                          │
+  │   Spill policy : oldest-written pages move to Tier 2 first              │
+  │                  ( FIFO — preserves most-recently-written pages hot )    │
+  │                                                                          │
+  │   Read path priority:                                                    │
+  │     Tier 1 (hot)  →  Tier 2 (spill)  →  Page Cache  →  Seek Index      │
+  │                                                                          │
+  │   On process crash : .vmdirty survives on disk.                          │
+  │   On next open     : VMM detects .vmdirty, invokes recovery protocol.   │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │  dirty_limit configuration                                            │
+  │                                                                       │
+  │    mount(path)                        default (256 MB)               │
+  │    mount(path, dirty_limit=N)         explicit limit in bytes         │
+  │    mount(path, dirty_limit=0)         spill-only (no Tier 1 budget)  │
+  │    mount(path, dirty_limit=INF)       no spill  (application         │
+  │                                       accepts OOM risk)              │
+  └───────────────────────────────────────────────────────────────────────┘
+
+  Invariants:
+
+    I-1  A page in Tier 1 or Tier 2 is removed only by:
+           (a) commit()             — page written to new ZIP
+           (b) discard()           — explicit caller decision
+           (c) recover_committed() — recovery decision
+           (d) recover_all()       — recovery decision
+         A dirty page is never removed by LRU eviction, OOM killer,
+         or any implicit path.
+
+    I-2  dirty_current always equals the sum of page_size for all pages
+         currently resident in Tier 1.  Pages in Tier 2 do not count
+         toward dirty_current.
+
+    I-3  The in-memory Tier 2 index is always consistent with .vmdirty
+         on disk.  If a record was appended to disk, it is reflected in
+         the index (or superseded by a newer record for the same page).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 2 : External Modification Detection
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Single-metric detection (mtime alone, or inode alone) is unreliable across
+  filesystems and network mounts.  The VMM uses a layered fingerprint with
+  cost-proportional fallback.
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Fingerprint  —  stored in .vmidx header at index-build time            │
+  │                                                                          │
+  │   field                source                    cost to check           │
+  │   ───────────────────────────────────────────────────────────────────── │
+  │   file_size            stat().st_size            O(1)                   │
+  │   inode                stat().st_ino             O(1)                   │
+  │   cd_hash              SHA-1 of Central          O(cd_size) ← fast      │
+  │                        Directory block only                              │
+  │   mtime_ns             stat().st_mtime_ns        O(1), diagnostics only  │
+  │   full_hash            SHA-1 of entire file      O(file_size) ← slow    │
+  │                        ( computed only in strict-fingerprint mode )      │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Validation cascade on open():
+
+  open( archive.zip )
+       │
+       ├─[1] FAST CHECK  — O(1)
+       │       Compare: file_size  AND  inode
+       │       Match   → proceed to step 2
+       │       Mismatch→ ──────────────────────────────────────→ INVALIDATE
+       │
+       ├─[2] MEDIUM CHECK  — O(cd_size), typically < 1 ms
+       │       Compare: cd_hash  ( Central Directory only )
+       │       Match   → index valid, mount immediately  ✓
+       │       Mismatch→ ──────────────────────────────────────→ INVALIDATE
+       │
+       └─[3]  mtime_ns is recorded in the .vmidx header for diagnostics
+              and audit trail purposes only.  It is not used as a validity
+              gate because it is unreliable on NFS, FAT, and some
+              distributed filesystems.
+
+  INVALIDATE path:
+       │
+       ├─ .vmdirty present?
+       │       YES → surface CONFLICT to caller:
+       │               source ZIP changed while dirty pages exist.
+       │               caller must resolve:  discard_dirty() | abort()
+       │               VMM does not auto-resolve.
+       │       NO  → silently rebuild .vmidx from scratch
+       │
+       └─ rebuild proceeds as first-open initialization
+
+
+  Strict fingerprint mode  ( mount option: --strict-fingerprint )
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  --strict-fingerprint                                                    │
+  │                                                                          │
+  │  Adds a full SHA-1 of archive.zip at every open(), regardless of        │
+  │  steps [1] and [2].  Correct even when mtime is stale or inode is       │
+  │  recycled.                                                               │
+  │                                                                          │
+  │  Intended for: NFS mounts, object storage with FUSE bridge,             │
+  │                shared caches across multiple hosts.                      │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 3 : File Lifecycle State Machine
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+                        open()
+                          │
+                          ▼
+                   ┌─────────────┐
+                   │   CHECKING  │  fingerprint validation cascade
+                   └──────┬──────┘
+               valid /         \ invalid
+                    /           \
+                   ▼             ▼
+          ┌──────────────┐   ┌─────────────────────┐
+          │    CLEAN     │   │  .vmdirty present?  │
+          │  (mounted,   │   └────────┬────────────┘
+          │  no changes) │       yes  │  no
+          └──────┬───────┘           │   │
+                 │ write()           │   ▼
+                 ▼                   │  ┌──────────────┐
+          ┌──────────────┐           │  │  REBUILDING  │──→ CLEAN
+          │    DIRTY     │           │  └──────────────┘
+          │  Tier1/Tier2 │           ▼
+          └──────┬───────┘     ┌────────────┐
+          within │ limit       │  CONFLICT  │
+          ───────┤             │  caller    │
+          exceed │             │  resolves  │
+                 ▼             └────────────┘
+          ┌──────────────┐
+          │   SPILLING   │  Tier 1 → Tier 2
+          └──────┬───────┘
+                 │ spill complete
+                 ▼
+          ┌──────────────┐
+          │    DIRTY     │  (continues accepting writes)
+          └──────┬───────┘
+                 │ commit()
+                 ▼
+          ┌──────────────┐
+          │  COMMITTING  │  recompress → write .new.zip → rename()
+          └──────┬───────┘
+                 │ rename() done
+                 ▼
+               CLEAN
+
+  State definitions:
+
+    CHECKING    Fingerprint validation is in progress.
+    CLEAN       Mounted with no uncommitted modifications.
+    DIRTY       One or more pages are modified and uncommitted.
+                Sub-state: pages may be in Tier 1, Tier 2, or both.
+    SPILLING    A spill operation is actively moving pages from Tier 1
+                to Tier 2.  Reads and writes are accepted; spill is
+                synchronous with the write that triggered it.
+    REBUILDING  .vmidx is being reconstructed from the source ZIP.
+    COMMITTING  commit() is in progress.
+    CONFLICT    Source ZIP changed while .vmdirty dirty pages exist.
+                The VMM is suspended; caller must resolve before mount
+                can proceed.
