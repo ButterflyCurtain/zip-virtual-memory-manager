@@ -30,7 +30,7 @@
   │        │       └─→ store in Tier 1, return immediately                   │
   │        │                                                                 │
   │        └─ dirty_current + page_size  >  dirty_limit   ← PRESSURE POINT  │
-  │                └─→ trigger Spill                                          │
+  │                └─→ trigger Spill  ( see Section 1.1 for spill modes )    │
   └──────────────────────────────────┬──────────────────────────────────────┘
                                      │  spill triggered
                                      ▼
@@ -57,9 +57,17 @@
   │    mount(path)                        default (256 MB)               │
   │    mount(path, dirty_limit=N)         explicit limit in bytes         │
   │    mount(path, dirty_limit=0)         spill-only (no Tier 1 budget)  │
-  │    mount(path, dirty_limit=INF)       no spill  (application         │
-  │                                       accepts OOM risk)              │
+  │    mount(path, dirty_limit=UNLIMITED) no spill; all dirty pages      │
+  │                                       remain in Tier 1 until         │
+  │                                       commit() or discard()          │
   └───────────────────────────────────────────────────────────────────────┘
+
+  dirty_limit=UNLIMITED disables the spill mechanism entirely.  All dirty
+  pages remain resident in Tier 1 for the duration of the session.  Memory
+  consumption grows proportionally to the total volume of unique modified
+  pages.  No .vmdirty file is written.  The application is responsible for
+  ensuring sufficient address space is available for the expected dirty
+  page volume.
 
   Invariants:
 
@@ -78,6 +86,84 @@
     I-3  The in-memory Tier 2 index is always consistent with .vmdirty
          on disk.  If a record was appended to disk, it is reflected in
          the index (or superseded by a newer record for the same page).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 1.1 : Spill Execution Modes
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Two spill execution modes govern whether the disk I/O associated with a
+  spill operation blocks the calling write() or runs in the background.
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Synchronous Spill  ( --sync-spill, default )                           │
+  │                                                                          │
+  │   Spill executes inline within the write() call that triggered it.      │
+  │   The caller blocks until enough pages have been written to .vmdirty    │
+  │   to bring dirty_current below dirty_limit.                             │
+  │                                                                          │
+  │   Suitable for:  single-threaded callers, batch workloads where         │
+  │                  write latency is not latency-sensitive.                 │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Asynchronous Spill  ( --async-spill )                                  │
+  │                                                                          │
+  │   A dedicated spill thread drains Tier 1 pages to .vmdirty in the      │
+  │   background.  The write() call that crosses dirty_limit returns to     │
+  │   the caller immediately after enqueueing the incoming page.            │
+  │                                                                          │
+  │   dirty_high_watermark                                                   │
+  │       = dirty_limit × spill_headroom_factor  ( default factor: 1.5 )   │
+  │                                                                          │
+  │   Backpressure:  if dirty_current reaches dirty_high_watermark,         │
+  │       write() blocks until the spill thread drains Tier 1 back below    │
+  │       dirty_limit.  This bounds worst-case memory use while keeping     │
+  │       the common case non-blocking.                                     │
+  │                                                                          │
+  │   Thread safety:                                                         │
+  │       Tier 1 deque and VmdirtyWriter share a single mutex.              │
+  │       write() holds the mutex only for the deque insertion step;        │
+  │       the disk write is performed by the spill thread outside the       │
+  │       mutex.  Reads to Tier 1 and Tier 2 proceed concurrently with      │
+  │       spill via a reader-writer lock.                                   │
+  │                                                                          │
+  │   flush() and commit() in async mode:                                   │
+  │       Both operations signal the spill thread to drain completely,      │
+  │       then wait for the drain to finish before proceeding.              │
+  │       This preserves the durability guarantee of flush() (STRICT).     │
+  │                                                                          │
+  │   Suitable for:  interactive or latency-sensitive workloads where       │
+  │                  write spike latency must be bounded.                   │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Mount option summary:
+
+    mount(path)                              sync spill, dirty_limit=256 MB
+    mount(path, --async-spill)               async spill, headroom factor=1.5
+    mount(path, --async-spill,
+               spill_headroom_factor=2.0)   async spill, custom headroom
+
+  The spill execution mode is orthogonal to the fsync mode (--sync-spill /
+  --lazy-spill) and the spill victim-selection policy (FIFO / LRU / CLOCK).
+  Any combination of these three axes is valid.
+
+  ┌───────────────────────────────────────────────────────────────────────────┐
+  │  Async spill — state diagram                                              │
+  │                                                                           │
+  │   write()                     Spill thread                               │
+  │   ───────                     ────────────                               │
+  │   enqueue page                                                            │
+  │   dirty_current ≤ dirty_limit → return immediately                        │
+  │   dirty_limit < dirty_current < dirty_high_watermark → return immediately │
+  │   dirty_current ≥ dirty_high_watermark → block on condition variable      │
+  │                               dequeue victim                              │
+  │                               write DATA RECORD to .vmdirty              │
+  │                               dirty_current -= page_size                  │
+  │                               if dirty_current < dirty_limit:             │
+  │                                   signal condition variable               │
+  │                               (blocked write() wakes and returns)         │
+  └───────────────────────────────────────────────────────────────────────────┘
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -177,6 +263,8 @@
                  ▼             └────────────┘
           ┌──────────────┐
           │   SPILLING   │  Tier 1 → Tier 2
+          │              │  ( sync: inline with write() )
+          │              │  ( async: background thread  )
           └──────┬───────┘
                  │ spill complete
                  ▼
@@ -198,9 +286,14 @@
     CLEAN       Mounted with no uncommitted modifications.
     DIRTY       One or more pages are modified and uncommitted.
                 Sub-state: pages may be in Tier 1, Tier 2, or both.
-    SPILLING    A spill operation is actively moving pages from Tier 1
-                to Tier 2.  Reads and writes are accepted; spill is
-                synchronous with the write that triggered it.
+                With dirty_limit=UNLIMITED: all dirty pages remain in
+                Tier 1; Tier 2 is never used.
+    SPILLING    A spill operation is moving pages from Tier 1 to Tier 2.
+                In synchronous mode: write() is blocked until spill completes.
+                In asynchronous mode: spill thread is active; write() returns
+                immediately unless dirty_high_watermark is reached.
+                Reads and writes are accepted in both modes.
+                Not reachable when dirty_limit=UNLIMITED.
     REBUILDING  .vmidx is being reconstructed from the source ZIP.
     COMMITTING  commit() is in progress.
     CONFLICT    Source ZIP changed while .vmdirty dirty pages exist.

@@ -38,7 +38,7 @@
 
 
   ┌──────────────────────────────────────────────────────────────────────────┐
-  │  FILE HEADER  ( fixed 80 bytes, offset 0 )                               │
+  │  FILE HEADER  ( fixed 88 bytes, offset 0 )                               │
   │                                                                          │
   │  offset  size  field                  notes                              │
   │  ──────  ────  ─────────────────────  ─────────────────────────────────  │
@@ -46,17 +46,17 @@
   │                                       0x56 4D 44 49 52 54 59 00          │
   │   8      2     format_version         0x0001                             │
   │  10      2     flags                  see FLAG BITS below                │
-  │  12      8     generation_id          see GENERATION ID below            │
-  │  20      8     source_file_size       stat().st_size of archive.zip      │
-  │  28      8     source_inode           stat().st_ino of archive.zip       │
-  │  36     20     source_cd_hash         SHA-1 of Central Directory block   │
-  │  56      8     created_at_ns          wall-clock ns; informational only  │
-  │  64      4     page_size              bytes per page (e.g. 4096)         │
-  │  68      4     reserved               0x00000000                         │
-  │  72      4     header_crc32           CRC-32C of bytes [0 .. 71]         │
-  │  76      4     padding                0x00000000                         │
+  │  12     16     generation_id          see GENERATION ID below            │
+  │  28      8     source_file_size       stat().st_size of archive.zip      │
+  │  36      8     source_inode           stat().st_ino of archive.zip       │
+  │  44     20     source_cd_hash         SHA-1 of Central Directory block   │
+  │  64      8     created_at_ns          wall-clock ns; informational only  │
+  │  72      4     page_size              bytes per page (e.g. 4096)         │
+  │  76      4     reserved               0x00000000                         │
+  │  80      4     header_crc32           CRC-32C of bytes [0 .. 79]         │
+  │  84      4     padding                0x00000000                         │
   │                                                                          │
-  │  Total: 80 bytes                                                         │
+  │  Total: 88 bytes                                                         │
   └──────────────────────────────────────────────────────────────────────────┘
 
   FLAG BITS  ( flags field, 16 bits )
@@ -67,15 +67,21 @@
                                   cleared when recovery completes
     bits 3–15  reserved; must be 0
 
-  GENERATION ID  ( 8 bytes )
+  GENERATION ID  ( 16 bytes )
 
-    Layout:  [ 48-bit timestamp_ns_truncated ][ 16-bit crypto_random ]
+    A 128-bit value drawn entirely from a cryptographically secure random
+    source at mount time.  It is structured as a UUID version 4 value:
 
-    The 48-bit portion is the lower 48 bits of a POSIX monotonic or
-    real-time clock reading taken at mount time.  The 16-bit portion is
-    drawn from a cryptographically secure random source.  The combined
-    value identifies a single mount session.  It is not a sequence number;
-    it does not increment across sessions.
+        bytes[0..5]   : random
+        bytes[6]      : 0x4?  ( version = 4, upper nibble fixed )
+        bytes[7]      : 0x8? / 0x9? / 0xA? / 0xB?  ( variant bits )
+        bytes[8..15]  : random
+
+    The generation_id is not a sequence number and does not increment
+    across sessions.  It identifies exactly one mount session.
+    Collision probability across any two sessions is negligible:
+    with 122 effective random bits, the probability of any collision
+    across 10^12 mount operations is below 10^{-13}.
 
 
   ┌──────────────────────────────────────────────────────────────────────────┐
@@ -84,36 +90,36 @@
   │  offset  size  field                  notes                              │
   │  ──────  ────  ─────────────────────  ─────────────────────────────────  │
   │   0      4     record_magic           0xD1A5EC0D                         │
-  │   4      8     generation_id          must equal header.generation_id    │
-  │  12      8     sequence_num           monotonically increasing, 1-based  │
-  │  20      2     entry_name_len         byte length of entry_name (N)      │
-  │  22      N     entry_name             UTF-8 ZIP entry path, no NUL       │
-  │  22+N    8     page_index             0-based page index within entry    │
-  │  30+N    4     data_len               equals header.page_size, except    │
+  │   4     16     generation_id          must equal header.generation_id    │
+  │  20      8     sequence_num           monotonically increasing, 1-based  │
+  │  28      2     entry_name_len         byte length of entry_name (N)      │
+  │  30      N     entry_name             UTF-8 ZIP entry path, no NUL       │
+  │  30+N    8     page_index             0-based page index within entry    │
+  │  38+N    4     data_len               equals header.page_size, except    │
   │                                       for the last page of an entry      │
   │                                       which may be smaller               │
-  │  34+N    D     data                   raw uncompressed page bytes        │
+  │  42+N    D     data                   raw uncompressed page bytes        │
   │                                       ( D = data_len )                   │
-  │  34+N+D  4     record_crc32           CRC-32C of bytes [0 .. 33+N+D]    │
+  │  42+N+D  4     record_crc32           CRC-32C of bytes [0 .. 41+N+D]    │
   │                                       covering record_magic through data  │
   │                                                                          │
-  │  Total: 38 + N + D  bytes                                                │
+  │  Total: 46 + N + D  bytes                                                │
   └──────────────────────────────────────────────────────────────────────────┘
 
   ┌──────────────────────────────────────────────────────────────────────────┐
-  │  COMMIT MARKER  ( fixed 32 bytes )                                       │
+  │  COMMIT MARKER  ( fixed 40 bytes )                                       │
   │                                                                          │
   │  offset  size  field                  notes                              │
   │  ──────  ────  ─────────────────────  ─────────────────────────────────  │
   │   0      4     marker_magic           0xC0FFEE42                         │
-  │   4      8     generation_id          must equal header.generation_id    │
-  │  12      8     commit_sequence        sequence_num of the last DATA      │
+  │   4     16     generation_id          must equal header.generation_id    │
+  │  20      8     commit_sequence        sequence_num of the last DATA      │
   │                                       RECORD included in this commit     │
-  │  20      8     page_count             total dirty page count at this     │
+  │  28      8     page_count             total dirty page count at this     │
   │                                       commit boundary                    │
-  │  28      4     marker_crc32           CRC-32C of bytes [0 .. 27]         │
+  │  36      4     marker_crc32           CRC-32C of bytes [0 .. 35]         │
   │                                                                          │
-  │  Total: 32 bytes                                                         │
+  │  Total: 40 bytes                                                         │
   └──────────────────────────────────────────────────────────────────────────┘
 
   CRC algorithm:
@@ -128,7 +134,7 @@
   FILE STRUCTURE — complete view:
 
   ┌──────────────────────────────────────────────────────────────────────────┐
-  │  [ FILE HEADER           ]   80 bytes, always present                   │
+  │  [ FILE HEADER           ]   88 bytes, always present                   │
   │  [ DATA RECORD  seq=1    ]   first spilled page                         │
   │  [ DATA RECORD  seq=2    ]                                               │
   │  [ DATA RECORD  seq=3    ]                                               │
@@ -157,16 +163,16 @@
     f = open(path, O_RDONLY)
 
     ── STEP 1: Validate header ──────────────────────────────────────────────
-    hdr = f.read(80)
-    if len(hdr) < 80:
+    hdr = f.read(88)
+    if len(hdr) < 88:
         return RecoveryResult(status=HEADER_TRUNCATED)
     if hdr[0:8] != b"VMDIRTY\0":
         return RecoveryResult(status=HEADER_MAGIC_BAD)
-    if crc32c(hdr[0:72]) != uint32_le(hdr[72:76]):
+    if crc32c(hdr[0:80]) != uint32_le(hdr[80:84]):
         return RecoveryResult(status=HEADER_CRC_BAD)
 
-    gen_id        = uint64_le(hdr[12:20])
-    page_size     = uint32_le(hdr[64:68])
+    gen_id        = bytes(hdr[12:28])           // 16-byte generation ID
+    page_size     = uint32_le(hdr[72:76])
     format_ver    = uint16_le(hdr[8:10])
     if format_ver > SUPPORTED_VERSION:
         return RecoveryResult(status=VERSION_UNSUPPORTED)
@@ -176,7 +182,7 @@
     last_commit_seq  = 0          # 0 = no commit marker seen
     truncation_point = None       # byte offset where truncation was detected
 
-    pos = 80
+    pos = 88
     while True:
         magic_buf = f.read(4)
         if len(magic_buf) == 0:
@@ -190,14 +196,14 @@
 
         ── DATA RECORD ──────────────────────────────────────────────────────
         if magic == 0xD1A5EC0D:
-            fixed = f.read(18)
-            if len(fixed) < 18:
+            fixed = f.read(26)          // gen(16) + seq(8) + name_len(2)
+            if len(fixed) < 26:
                 truncation_point = pos
                 break
 
-            record_gen  = uint64_le(fixed[0:8])
-            seq_num     = uint64_le(fixed[8:16])
-            name_len    = uint16_le(fixed[16:18])
+            record_gen  = bytes(fixed[0:16])
+            seq_num     = uint64_le(fixed[16:24])
+            name_len    = uint16_le(fixed[24:26])
 
             if record_gen != gen_id:
                 truncation_point = pos
@@ -241,15 +247,15 @@
 
         ── COMMIT MARKER ────────────────────────────────────────────────────
         elif magic == 0xC0FFEE42:
-            rest = f.read(28)
-            if len(rest) < 28:
+            rest = f.read(36)           // gen(16) + commit_seq(8) + page_count(8) + crc(4)
+            if len(rest) < 36:
                 truncation_point = pos
                 break
 
-            marker_gen    = uint64_le(rest[0:8])
-            commit_seq    = uint64_le(rest[8:16])
-            covered       = magic_buf + rest[0:24]
-            expected_crc  = uint32_le(rest[24:28])
+            marker_gen    = bytes(rest[0:16])
+            commit_seq    = uint64_le(rest[16:24])
+            covered       = magic_buf + rest[0:32]
+            expected_crc  = uint32_le(rest[32:36])
 
             if marker_gen != gen_id or crc32c(covered) != expected_crc:
                 truncation_point = pos
@@ -560,7 +566,7 @@
   Recovery and session transition:
 
     On a fresh mount after recovery:
-        old .vmdirty → rename to .vmdirty.bak.{generation_id}
+        old .vmdirty → rename to .vmdirty.bak.{generation_id hex}
         new .vmdirty → created with a new generation_id
         .vmdirty.bak.* → retained for forensics; not used by the VMM
 
@@ -600,6 +606,10 @@
 
     write(entry_name, page_index, data)
         Checks dirty_limit.  Triggers spill via VmdirtyWriter if exceeded.
+        In synchronous spill mode: spill executes inline before returning.
+        In asynchronous spill mode: page is enqueued; caller returns
+        immediately unless backpressure threshold is reached
+        (see Diff Layer Pressure specification).
         Updates FIFO deque and index.
 
     read(entry_name, page_index) → Optional<bytes>
@@ -620,10 +630,13 @@
   VmmMount
 
     open(path, options)
+        Acquires advisory lock on archive.zip.vmlock.
         Runs fingerprint validation.
         Runs VmdirtyReader if .vmdirty is present.
         Routes to recovery decision tree.
         Exposes RecoveryResult to caller.
+        Removes orphan archive.zip.vmdirty.compact and archive.new.zip
+        if present with no active mount.
 
     RecoveryHandler interface
         onRecovery(RecoveryResult) → RecoveryDecision
@@ -631,7 +644,7 @@
 
     applyRecovery(decision, result)
         Loads committed_pages (and optionally uncommitted_pages) into Tier 1.
-        Renames old .vmdirty to .vmdirty.bak.{generation_id}.
+        Renames old .vmdirty to .vmdirty.bak.{generation_id hex}.
         Creates new .vmdirty for the current session.
 
     flush()
@@ -640,9 +653,24 @@
 
     commit()
         Calls flush() (STRICT).
-        Proceeds with recompress → write archive.new.zip → rename().
+        Selects INCREMENTAL or FULL path based on bloat_ratio and gc_threshold.
+        INCREMENTAL: appends modified entry data + new CD + EOCD to archive.zip.
+        FULL: recompress → write archive.new.zip → rename().
         On success: deletes .vmdirty; updates .vmidx for modified entries.
-        On failure before rename: .vmdirty remains; recovery path is intact.
+        On failure before archive modification: .vmdirty remains intact;
+        recovery path is intact.
+
+    compact()
+        Permitted only from CLEAN state (no dirty pages).
+        Performs FULL (compaction) commit with an empty Diff Layer.
+        Eliminates accumulated dead data in archive.zip.
+        Does not touch .vmdirty (none is present in CLEAN state).
+
+    compactJournal()
+        Triggered internally when dead_record_count > live_record_count.
+        Executes the compaction procedure defined in Section 10.
+        Not directly callable by the application; it is an internal
+        maintenance operation of Tier1DirtyStore.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -662,10 +690,13 @@
            (c) recover_committed() / recover_all() — recovery decision
          It is never removed by LRU eviction, OOM killer, or any implicit path.
 
-  I-3  .vmdirty grows monotonically within a session.
+  I-3  .vmdirty grows monotonically within a session, except during compaction.
          Records are only appended, never overwritten in place.
-         Exception: the header flags field may be updated in place for the
+         Exception 1: the header flags field may be updated in place for the
          RECOVERY_PENDING bit (single aligned write; safe on all platforms).
+         Exception 2: compaction (Section 10) replaces .vmdirty atomically
+         via rename() of archive.zip.vmdirty.compact, producing a smaller
+         file with no dead records.  After rename(), monotonic growth resumes.
 
   I-4  A COMMIT MARKER sequence number is always ≥ the previous commit
          sequence.  Commit markers are never written out of order.
@@ -680,6 +711,11 @@
   I-7  After flush() returns (STRICT mode), all dirty pages are durable.
          A crash after flush() is fully recoverable via recover_committed().
 
+  I-8  At most one process holds LOCK_EX on archive.zip.vmlock at any time.
+         This is enforced by the kernel; no additional in-process coordination
+         is required beyond acquiring the lock at open() and releasing at
+         close().
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   SECTION 9 : Sidecar File Naming and Co-location Rules
@@ -687,12 +723,14 @@
 
   archive.zip                       source ZIP (read-only until commit)
   archive.zip.vmidx                 seek index (rebuilt if absent or stale)
+  archive.zip.vmlock                advisory lock coordination file
   archive.zip.vmdirty               spill journal (current session)
   archive.zip.vmdirty.bak.{gen_id}  recovered journal (forensics retention)
 
   If archive.zip is moved, all sidecar files must move with it.
 
   A ZIP without its .vmidx is still a valid ZIP; first-open rebuilds the index.
+  A ZIP without its .vmlock is handled by creating the file at next open().
 
   A ZIP without its .vmdirty means dirty pages from a prior session are lost.
   The source ZIP itself is unaffected.
@@ -702,3 +740,108 @@
     .vmidx is updated for modified entries only.
     .vmdirty.bak.* files are retained for a configurable period
     (default: 24 hours, or deleted at next clean mount).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 10 : Journal Compaction
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The .vmdirty file grows monotonically within a session.  When the same
+  page is written multiple times and spills to Tier 2 on each occasion,
+  a new DATA RECORD is appended for each spill while the prior records for
+  the same (entry_name, page_index) remain on disk as unreferenced data.
+  Compaction eliminates these dead records, bounding .vmdirty size to
+  one DATA RECORD per unique live dirty page.
+
+  Terminology:
+
+    live record  :  the highest-sequence DATA RECORD for a given
+                    (entry_name, page_index) pair; the record currently
+                    indexed by VmdirtyIndex.
+    dead record  :  any DATA RECORD superseded by a later record for the
+                    same (entry_name, page_index) pair.
+
+
+  Compaction trigger:
+
+    Compaction is evaluated after each spill operation.  The condition is:
+
+        dead_record_count  >  live_record_count
+
+    This means more than half the records on disk are dead.
+    dead_record_count is tracked in-memory (incremented on each write hit
+    to a Tier 2 page) and requires no disk scan to evaluate.
+
+
+  Compaction procedure:
+
+    1. Build a write buffer containing:
+
+         a.  FILE HEADER with a new generation_id drawn from a
+             cryptographically secure random source.
+
+         b.  One DATA RECORD per entry in VmdirtyIndex, using the live page
+             data.  Sequence numbers are assigned 1, 2, 3, … in arbitrary
+             order (the new generation_id makes sequence numbering independent
+             of the prior session).
+
+         c.  A COMMIT MARKER with commit_sequence = highest assigned
+             sequence number, if and only if all live records were
+             previously committed in the prior session
+             ( i.e. original_sequence ≤ last_commit_seq for every live page ).
+             If any live record was uncommitted, no COMMIT MARKER is written.
+
+    2. Write the buffer to  archive.zip.vmdirty.compact.
+
+    3. fdatasync()  on  archive.zip.vmdirty.compact.
+
+    4. rename( archive.zip.vmdirty.compact → archive.zip.vmdirty ).
+
+    5. Rebuild VmdirtyIndex by reading the compacted file from the start
+       ( offsets have changed ).
+
+    6. Set last_commit_seq to the new commit_sequence if a COMMIT MARKER
+       was written in step 1c; otherwise set last_commit_seq = 0.
+
+    7. Reset dead_record_count = 0.
+
+
+  Crash safety:
+
+    Crash before step 4 :  archive.zip.vmdirty is unchanged.
+                           archive.zip.vmdirty.compact is an orphan;
+                           it is removed silently at next open().
+    Crash after step 4  :  the compacted file is the recovery basis.
+                           Its format is identical to an ordinary .vmdirty
+                           and is processed by the standard recovery protocol
+                           in Section 3.  No special recovery case is required.
+
+
+  Commit marker semantics after compaction:
+
+    Pages that were committed before compaction remain committed after it.
+    The COMMIT MARKER in the compacted file re-establishes that boundary.
+    Pages that were uncommitted before compaction remain uncommitted after it;
+    no COMMIT MARKER covers them in the compacted file.
+
+    Consequence for flush() guarantee (I-7):
+      If flush() (STRICT) completed before compaction, all dirty pages were
+      committed.  The compacted file carries a COMMIT MARKER covering all
+      live records.  A crash after compaction is fully recoverable via
+      recover_committed().  The guarantee is not weakened.
+
+
+  Invariants preserved after compaction:
+
+    I-2  dirty_current is unchanged.  Compaction operates on Tier 2 only;
+         Tier 1 content is not moved or affected.
+
+    I-3  VmdirtyIndex is rebuilt in step 5 to be consistent with the
+         compacted file.
+
+    I-5  sequence_num is strictly monotonically increasing within the
+         new file.  Renumbering from 1 is valid because the new file
+         carries a new generation_id; no prior record carries the new
+         generation_id.
+
+    I-7  flush() durability guarantee is preserved as described above.
