@@ -1,0 +1,724 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                                                                              ║
+║                        ZIP Virtual Memory Manager                            ║
+║                          Concurrent Access                                   ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+  The VMM coordinates access between processes that open the same archive
+  using an advisory lock on a dedicated sidecar file: archive.zip.vmlock.
+  This prevents concurrent dirty sessions from corrupting .vmdirty and
+  serializes commit() against active read mounts.
+
+  Lock acquisition is delegated to a LockProvider, which encapsulates the
+  platform-specific locking primitive.  The VMM core is independent of any
+  particular locking mechanism; the provider is configured at mount time.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 1 : Lock File
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Lock file path:  archive.zip.vmlock
+
+  The .vmlock file is created at first open() if absent.  Its presence on
+  disk carries no semantics: a .vmlock file with no active kernel lock
+  indicates no live mount, not a crash or an error.  Lock state is
+  maintained entirely by the kernel and is released automatically on
+  process exit.
+
+  The lock is placed on .vmlock rather than on archive.zip for two reasons:
+
+    (a) archive.zip may be opened simultaneously by third-party tools
+        (unzip, 7-Zip, etc.) that have no awareness of VMM locking.
+        Locking .vmlock leaves those tools unaffected.
+
+    (b) commit() renames archive.new.zip over archive.zip, replacing the
+        inode.  A lock held on archive.zip before the rename would be held
+        on the old inode; a new opener would acquire the lock on the new
+        inode without conflict.  Locking .vmlock avoids this inode
+        replacement problem: .vmlock is never renamed.
+
+  The .vmlock file is not deleted on close().  It is safe to delete it
+  manually when no VMM process is running.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 2 : Lock Modes
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Two mount modes determine which lock is acquired.
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Read-Write Mount  ( default )                                           │
+  │                                                                          │
+  │   Lock acquired:  LOCK_EX  ( exclusive )                                │
+  │                                                                          │
+  │   Blocks until:   all other processes release both LOCK_EX and          │
+  │                   LOCK_SH on .vmlock.                                   │
+  │                                                                          │
+  │   Invariant:      at most one read-write mount is active at any time.   │
+  │                   At most one process holds LOCK_EX at any time         │
+  │                   (enforced by the kernel; no application-level         │
+  │                   coordination is required).                            │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Read-Only Mount  ( --read-only )                                        │
+  │                                                                          │
+  │   Lock acquired:  LOCK_SH  ( shared )                                   │
+  │                                                                          │
+  │   Blocks until:   any LOCK_EX holder releases.                          │
+  │                                                                          │
+  │   Concurrency:    multiple read-only mounts may coexist.                │
+  │                   A read-only mount prevents a new read-write mount     │
+  │                   from acquiring LOCK_EX until all LOCK_SH holders     │
+  │                   release.                                              │
+  │                                                                          │
+  │   Constraints:    write(), flush(), and commit() are not available      │
+  │                   on a read-only mount.  Calling any of these returns   │
+  │                   EROFS immediately without acquiring the write lock.   │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Compatibility matrix:
+
+    Active mount(s)          New open attempt          Result
+    ──────────────────────   ───────────────────────   ────────────────────
+    none                     read-write                succeeds immediately
+    none                     read-only                 succeeds immediately
+    1 × read-write           read-write                blocks
+    1 × read-write           read-only                 blocks
+    N × read-only            read-only                 succeeds immediately
+    N × read-only            read-write                blocks
+
+
+  LOCK_EX long-hold and its effect on read-only openers
+
+    A read-write mount holds LOCK_EX from open() to close().  This is a
+    deliberate design: the lock covers the entire session, not just the
+    commit() step, because the .vmdirty journal is written throughout the
+    session and must not be observable by a concurrent writer.
+
+    A direct consequence is that any process that calls open() in read-only
+    mode while a read-write session is active will block at lock acquisition
+    for the full duration of that session.  The blocked call consumes no
+    CPU; it waits in the kernel's lock queue.
+
+    Duration characteristics by workload:
+
+      Short-lived R/W session  ( seconds )
+          Typical for pipelines that open an archive, apply a batch of
+          writes, commit, and close immediately.  Read-only openers
+          experience at most a brief delay.
+
+      Long-lived R/W session  ( minutes to hours )
+          Typical for interactive or iterative workloads: an editor that
+          holds a file open, a computation pipeline that writes results
+          incrementally over a long run.  Read-only openers block for
+          the entire session.  This is the primary operational constraint
+          of the coarse-grained locking design.
+
+      Background commit  ( background_compact=true or mode=BACKGROUND )
+          The LOCK_EX is held throughout the BUILD, MERGE, and RENAME
+          phases.  Background commit reduces the time during which the
+          .vmdirty journal represents the only copy of dirty data, and
+          it reduces the duration of the MERGE pause, but it does not
+          shorten the lock-hold period from the R/O opener's perspective.
+          The archive remains exclusively held for the R/W session's
+          lifetime.
+
+    Mitigations available to the application:
+
+      --lock-nowait
+          R/O open() returns LOCK_CONTENTION immediately on contention
+          rather than blocking.  The caller may retry on a schedule or
+          notify the user that the archive is currently in use.
+
+      Session discipline
+          The most effective mitigation is application-level: open the
+          archive for writing only during a discrete work unit, commit,
+          and close.  Holding a R/W mount open between work units — even
+          if no writes are pending — blocks all R/O access for that period.
+
+      Archive partitioning
+          Workloads that require simultaneous R/W and R/O access to
+          different subsets of data should partition data across multiple
+          archives.  The lock granularity in the current design is one
+          lock per archive; separate archives have independent locks.
+
+      Deferred read-only access
+          R/O access to committed state can be served from a copy or
+          snapshot of archive.zip made after the previous commit(),
+          avoiding any need to open the live archive concurrently.
+
+    What LOCK_EX does not protect against:
+
+      LOCK_EX prevents concurrent VMM mounts from accessing the archive.
+      It does not prevent external tools (unzip, cp, rsync, etc.) that
+      do not use the .vmlock protocol from reading archive.zip during the
+      R/W session.  Such external reads see a consistent ZIP (the source
+      ZIP is not modified until commit() completes), but they may observe
+      intermediate states of archive.new.zip if they scan the directory.
+      External writes to archive.zip during the R/W session are detected
+      by ESTALE checking on the next Page Cache miss (see main architecture
+      document, SNAPSHOT CONSISTENCY section).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 3 : Lock Acquisition and Release Protocol
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  3.1  Acquisition
+
+  open( archive.zip, mode )
+       │
+       ├─ open or create archive.zip.vmlock  ( O_CREAT | O_RDWR )
+       │
+       ├─ mode == READ_WRITE:
+       │       provider.acquire_exclusive()   ← blocking by default
+       │
+       ├─ mode == READ_ONLY:
+       │       provider.acquire_shared()      ← blocking by default
+       │
+       ├─ Non-blocking variant  ( --lock-nowait ):
+       │       provider.try_acquire_exclusive()
+       │       on failure → return LOCK_CONTENTION to caller
+       │
+       └─ On lock acquired: proceed with fingerprint validation and mount
+
+  Non-blocking mode is intended for applications that poll for mount
+  availability or implement their own retry logic.
+
+  3.2  Release
+
+  close()
+       │
+       ├─ provider.release()
+       └─ close( vmlock_fd )
+
+  The kernel releases the lock automatically on:
+    - explicit close()
+    - process exit (normal or abnormal)
+    - process kill (including SIGKILL)
+
+  There is no stale-lock condition.  If a process holding LOCK_EX dies
+  without calling close(), the kernel releases the lock and the next
+  open() acquires it normally.  A .vmdirty left behind by the dead
+  process is handled by the recovery protocol at that open().
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 4 : Interaction with commit()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  commit() runs entirely within an existing LOCK_EX session.  No lock
+  upgrade is needed.  The sequence is:
+
+    (lock is already held as LOCK_EX)
+    flush()          → all dirty pages durable in .vmdirty
+    recompress       → write archive.new.zip
+    rename()         → archive.new.zip → archive.zip  (POSIX atomic)
+    update .vmidx
+    delete .vmdirty
+    (LOCK_EX continues until close())
+
+  Because LOCK_EX blocks any LOCK_SH holder from acquiring in the
+  interim, no read-only mount can observe a partially-completed commit().
+  A read-only mount that was active before commit() began will block on
+  any subsequent open() attempt until the commit() session closes.
+
+  A read-only mount that is already open during commit() holds LOCK_SH
+  and prevents a second read-write mount from starting, but it does not
+  block the existing read-write mount's commit() because the commit()
+  does not re-acquire the lock.
+
+  The rename() that replaces archive.zip is POSIX atomic on local
+  filesystems.  Processes with archive.zip already open will continue
+  to read from the old inode via their file descriptors; new opens will
+  see the new inode.  The .vmlock file is unaffected by the rename.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 5 : LockProvider Interface
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The LockProvider interface abstracts all platform-specific locking
+  operations.  The VMM core holds a reference to a provider instance and
+  calls only the interface methods; it has no direct dependency on any
+  locking primitive.
+
+  interface LockProvider:
+
+      acquire_shared()          → void
+          Acquires a shared (read) lock.  Blocks until acquired.
+
+      acquire_exclusive()       → void
+          Acquires an exclusive (write) lock.  Blocks until acquired.
+
+      try_acquire_shared()      → bool
+          Non-blocking shared acquisition.  Returns true on success.
+
+      try_acquire_exclusive()   → bool
+          Non-blocking exclusive acquisition.  Returns true on success.
+
+      release()                 → void
+          Releases any currently held lock.
+
+      is_process_exit_safe()    → bool
+          Returns true if the underlying primitive is released automatically
+          on process exit without requiring an explicit release() call.
+          Used by the fork() handler to determine whether child cleanup
+          is safe.
+
+      invalidate_after_fork()   → void
+          Called by the post-fork child handler.  Releases the child's
+          inherited file descriptor reference without issuing an unlock
+          primitive.  The parent's lock is not disturbed.
+          ( See Section 7 for fork() semantics. )
+
+
+  Built-in implementations
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  Provider                Primitive              Scope                   │
+    │  ──────────────────────  ─────────────────────  ──────────────────────  │
+    │  FlockLockProvider       flock(2) / LockFileEx  local + same-host NFS  │
+    │  (default)                                                               │
+    │                                                                          │
+    │  FcntlLockProvider       fcntl(F_SETLKW) /      local + NLM/NFSv4      │
+    │                          POSIX byte-range        advisory locks          │
+    │                                                                          │
+    │  ExternalLockProvider    application callback   distributed systems;    │
+    │                                                 Redis, ZooKeeper, etcd  │
+    │                                                 or any custom backend   │
+    │                                                                          │
+    │  NoOpLockProvider        none                   single-process use;     │
+    │                                                 caller guarantees        │
+    │                                                 exclusive access         │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+  FlockLockProvider  ( default )
+
+    Uses flock(2) on POSIX platforms (Linux, macOS, FreeBSD) and
+    LockFileEx / UnlockFileEx on Windows (byte-range lock on byte 0,
+    length 1; exclusive and shared flags map to LOCK_EX / LOCK_SH).
+
+    flock() locks are per open file description, not per file descriptor.
+    Duplicating a file descriptor shares the lock.  The fork() handler
+    described in Section 7 handles this correctly.
+
+  FcntlLockProvider
+
+    Uses fcntl(F_SETLKW) POSIX byte-range advisory locks.  On Linux,
+    fcntl() advisory locks are forwarded to the NFS server via the NLM
+    protocol (NFSv3) or integrated lock manager (NFSv4), providing
+    reliable cross-host advisory locking when the NFS server honours them.
+
+    Unlike flock(), fcntl() locks are per process, not per open file
+    description.  A child process created by fork() does not inherit
+    fcntl() locks; no special post-fork cleanup is needed for this
+    provider.
+
+    Suitable for NFS mounts where cross-host locking is required.
+
+  ExternalLockProvider
+
+    The application supplies acquire/release callbacks that delegate to any
+    external coordination service.  The VMM does not specify or constrain
+    the protocol; correctness is the application's responsibility.
+
+    ExternalLockProvider.is_process_exit_safe() returns false; the
+    application's lock manager may hold a lease beyond process death and
+    must implement its own expiry logic.
+
+  NoOpLockProvider
+
+    All methods are no-ops.  Appropriate only when the application
+    guarantees that at most one VMM mount is active at any time through
+    its own access control.  Using this provider when concurrent access
+    is possible leads to undefined behaviour.
+
+  Mount configuration
+
+    mount(path)
+        Uses FlockLockProvider.  Default.
+
+    mount(path, lock_provider=FcntlLockProvider)
+        Uses fcntl() POSIX byte-range locks.
+
+    mount(path, lock_provider=ExternalLockProvider(acquire_cb, release_cb))
+        Delegates to application-supplied callbacks.
+
+    mount(path, lock_provider=NoOpLockProvider)
+        No locking.  Caller guarantees exclusive access.
+
+    mount(path, --lock-nowait)
+        Applies to any provider; switches acquisition to non-blocking mode.
+        On contention: returns LOCK_CONTENTION immediately.
+
+
+  Platform primitives summary
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  Platform        FlockLockProvider         FcntlLockProvider            │
+    │  ─────────────   ─────────────────────     ──────────────────────────── │
+    │  Linux           flock(2)                  fcntl(F_SETLKW)              │
+    │                  per open file description  per process                  │
+    │  macOS           flock(2)                  fcntl(F_SETLKW)              │
+    │  FreeBSD         flock(2)                  fcntl(F_SETLKW)              │
+    │  Windows         LockFileEx / UnlockFileEx  —  (not applicable)         │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 6 : Crash Recovery Interaction
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  When a read-write mount crashes:
+
+    1. The kernel releases LOCK_EX on .vmlock automatically
+       (FlockLockProvider / FcntlLockProvider).
+       ExternalLockProvider leases expire per the external service's policy.
+    2. .vmdirty remains on disk with whatever records were written before
+       the crash.
+    3. The next open() acquires LOCK_EX, finds .vmdirty, and runs the
+       recovery protocol (see vmdirty Journal Specification, Section 3).
+    4. The caller resolves the RecoveryResult before the mount proceeds.
+
+  There is no race between step 1 and step 3.  The lock is released by
+  the kernel as an atomic consequence of the file descriptor closing;
+  the next open() cannot proceed past lock acquisition until this has
+  happened.
+
+  When a read-only mount crashes:
+
+    1. The kernel releases LOCK_SH automatically.
+    2. No .vmdirty is written by a read-only mount.
+    3. No recovery is needed.
+
+  Sequence when a new open() races with a just-crashed writer:
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  Writer process               New open()                             │
+  │  ──────────────               ─────────                              │
+  │  [crash — kernel releases                                            │
+  │   LOCK_EX on .vmlock]                                                │
+  │                               acquire_exclusive() → succeeds         │
+  │                               fingerprint validation                 │
+  │                               .vmdirty found → recovery protocol    │
+  │                               RecoveryResult → caller decision       │
+  │                               mount proceeds                         │
+  └──────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 7 : fork() Boundary Handling
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  7.1  The fork() problem
+
+  A fork() call duplicates the parent's file descriptors.  For
+  FlockLockProvider, both parent and child inherit the same open file
+  description (OFD) for vmlock_fd.  flock() locks are associated with
+  the OFD, not individual file descriptors.  This creates two problems:
+
+    (a) The child holds an unexpected reference to the parent's lock.
+        If the child calls flock(LOCK_UN) on its inherited vmlock_fd,
+        it releases the lock for the parent as well, since both file
+        descriptors reference the same OFD.
+
+    (b) If the child calls open() on the same archive to acquire its
+        own mount, it will attempt to acquire LOCK_EX — but the parent
+        already holds it.  The child blocks indefinitely.
+
+  For FcntlLockProvider, fcntl() locks are per process and are not
+  inherited across fork().  The child starts with no lock held;
+  problem (a) does not apply.  Problem (b) applies only if the parent
+  holds a lock and the child attempts to acquire the same one.
+
+  7.2  Automatic fork() handling via pthread_atfork
+
+  The VMM registers a pthread_atfork() handler at library initialisation.
+  This registration happens once per process image, regardless of the
+  number of archives opened.
+
+    Prepare handler  ( runs in parent before fork() ):
+        For each active VmmMount with a dirty Diff Layer:
+            call flush()  ( STRICT )
+        This ensures .vmdirty is fully durable before the process image
+        is duplicated.  If flush() fails (e.g. disk full), fork() is
+        allowed to proceed; the child inherits a consistent, if incomplete,
+        dirty state.
+
+    Parent handler  ( runs in parent after fork() returns ):
+        No action required.  The parent's mounts continue normally.
+
+    Child handler  ( runs in child after fork() returns ):
+        For each active VmmMount:
+            call provider.invalidate_after_fork()
+            This calls close(vmlock_fd) on the inherited fd without
+            issuing any unlock primitive.  For FlockLockProvider, this
+            decrements the OFD refcount; the parent retains the lock
+            because its own fd still references the OFD.
+            Mark the VmmMount as INVALID_AFTER_FORK.
+        After the handler returns, all inherited VmmMount instances are
+        in state INVALID_AFTER_FORK.  Any operation on them returns
+        FORK_BOUNDARY_VIOLATION immediately.
+
+  7.3  Child process behaviour after fork()
+
+  A child process that needs VMM access must call open() on the archive
+  independently.  This creates a new VmmMount with its own vmlock_fd and
+  acquires the lock fresh.
+
+  If the parent holds LOCK_EX on the archive when fork() is called, the
+  child's open() will block until the parent releases its mount.  The
+  application is responsible for sequencing these operations correctly:
+  either the parent closes its mount before the child opens one, or the
+  parent and child use separate archives, or the child uses read-only
+  mode once the parent's exclusive session ends.
+
+  7.4  ExternalLockProvider fork() behaviour
+
+  ExternalLockProvider.invalidate_after_fork() closes any local file
+  descriptors held by the provider without issuing a remote unlock.
+  The external lock remains held by the parent process.  If the external
+  service identifies locks by a lease token or connection identifier,
+  the child's copy of that token is invalidated; any attempt to use it
+  returns FORK_BOUNDARY_VIOLATION before reaching the external service.
+
+  7.5  Interaction with pthread_atfork and third-party libraries
+
+  The VMM's pthread_atfork() handler may run in any order relative to
+  handlers registered by other libraries.  The flush() in the prepare
+  handler is idempotent; running it multiple times is safe.  The child
+  handler's invalidation is also idempotent.
+
+  Applications that use exec() after fork() (the fork-exec idiom) incur
+  no special VMM concern: exec() closes all file descriptors not marked
+  O_CLOEXEC, and the VMM opens vmlock_fd with O_CLOEXEC set.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 8 : Invariants
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  C-1  At most one LOCK_EX holder exists at any time for a given .vmlock.
+         This is enforced by the kernel (FlockLockProvider, FcntlLockProvider)
+         or by the external coordination service (ExternalLockProvider).
+
+  C-2  A read-write mount holds LOCK_EX for its entire lifetime, from
+         open() to close().  It never downgrades to LOCK_SH.
+
+  C-3  A read-only mount holds LOCK_SH for its entire lifetime.
+         It never upgrades to LOCK_EX.
+
+  C-4  .vmdirty is written only by the LOCK_EX holder.
+         No read-only mount appends records to .vmdirty.
+
+  C-5  On crash (FlockLockProvider / FcntlLockProvider), the kernel
+         releases the lock before any subsequent open() can proceed past
+         lock acquisition.  A new mount always sees a fully consistent
+         .vmdirty for the crashed session.
+
+  C-6  flock() on .vmlock is independent of any lock on archive.zip.
+         Third-party tools that open archive.zip are not affected by
+         the VMM lock, and do not interfere with it.
+
+  C-7  After fork(), all inherited VmmMount instances in the child are
+         marked INVALID_AFTER_FORK.  The child never issues an unlock
+         primitive on any lock inherited from the parent.  The parent's
+         lock is unaffected by the child process.
+
+  C-8  vmlock_fd is opened with O_CLOEXEC.  A fork() followed by exec()
+         closes vmlock_fd in the child automatically, with no lock release.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 9 : Use Case Scope and Constraints
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The VMM's concurrency model is designed for discrete, session-oriented
+  access patterns where a single writer performs a bounded unit of work
+  and commits.  The coarse-grained lock is a deliberate match for this
+  model; it is not a limitation to be worked around but a constraint that
+  defines the scope of correct use.
+
+  Workloads within scope:
+
+    Single-writer batch modification
+        One process opens an archive, applies a set of writes, calls
+        commit(), and closes.  Other processes that need read access wait
+        for the session to close.  LOCK_EX hold time equals the work unit
+        duration.  This is the primary intended use case.
+
+    Sequential pipeline stages
+        Stage A writes and commits; Stage B opens read-only after A
+        closes.  No concurrent access; the lock protocol is trivially
+        satisfied.  Multiple read-only stages can overlap freely.
+
+    Build systems
+        A build process opens a large archive read-only to load source
+        inputs (no write lock contention among parallel readers).  A final
+        packaging step opens read-write to commit outputs.  These phases
+        are naturally sequential in a typical build graph.
+
+    Incremental archival with periodic commits
+        A long-running process accumulates writes in .vmdirty, calls
+        commit() at checkpoints (hourly, after N writes, etc.), and
+        remains open between checkpoints.  Read-only access is unavailable
+        during the session but commits are infrequent relative to the
+        session duration.  Acceptable when no concurrent read requirement
+        exists.
+
+    Offline embedded archives
+        Application data stored as a ZIP that is accessed by a single
+        application process (mobile app, game asset bundle, desktop tool).
+        At most one process accesses the archive at a time; the lock
+        protocol is a safety net for abnormal process lifecycle events,
+        not a daily coordination mechanism.
+
+  Workloads outside scope:
+
+    High-frequency concurrent writes from multiple independent processes
+        LOCK_EX serialises all write sessions.  If two processes need to
+        write simultaneously, they must use separate archives and merge
+        results out-of-band, or use a database or key-value store designed
+        for concurrent write access.
+
+    Real-time collaborative access  ( multiple concurrent readers + writer )
+        The coarse lock prevents any read-only mount from opening while a
+        write session is active.  Applications requiring sub-second
+        concurrent read availability alongside ongoing writes are outside
+        the scope of this design.
+
+    Live replication or hot-standby
+        The VMM provides no streaming or replication protocol.  A replica
+        of archive.zip is a point-in-time copy from the last commit(); it
+        is not kept in sync by the VMM.
+
+    High-frequency random writes with low commit latency
+        Each commit() recompresses modified entries (INCREMENTAL path) or
+        rewrites the full archive (FULL path).  For workloads requiring
+        thousands of write-commit cycles per second, the per-commit cost
+        is prohibitive.  A mutable on-disk format (SQLite, LMDB, a custom
+        flat file) is more appropriate.
+
+    Distributed multi-host concurrent access without NFS advisory locking
+        FlockLockProvider over NFS is unreliable on many NFS
+        configurations.  FcntlLockProvider with NLM/NFSv4 provides
+        cross-host advisory locking where the NFS server supports it;
+        correctness depends on server and client NFS implementation.
+        ExternalLockProvider with a distributed coordination service
+        (ZooKeeper, etcd, Consul) is the reliable choice for multi-host
+        deployments, but adds operational complexity and a dependency on
+        the coordination service's availability.
+
+  Session discipline recommendations:
+
+    Keep R/W session duration proportional to the work being done.
+        open → write → commit → close is the canonical pattern.
+        Do not hold a R/W mount open across user-interaction delays,
+        network waits, or sleep/suspend cycles.
+
+    Prefer background commit for archives with large dirty states.
+        commit(mode=BACKGROUND) returns control to the caller while the
+        ZIP is rewritten, reducing the fraction of session time during
+        which the archive is actively being rebuilt.  LOCK_EX is held
+        throughout, but the caller can continue working during BUILD.
+
+    Use --lock-nowait when the application can handle contention gracefully.
+        Surfaces LOCK_CONTENTION immediately; allows the application to
+        present a retry UI or fall back to read-only access via a prior
+        committed version of the archive.
+
+    Separate read and write phases explicitly at the application level.
+        If a process needs both read and write access to the same data,
+        design the access pattern so reads complete before the write phase
+        opens, or structure the data across multiple archives with
+        independent lock domains.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 10 : Fine-Grained Locking — Extension Model
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The current design uses one lock per archive.  This section describes the
+  structural constraints on moving to per-entry or per-shard locking, and
+  what a future extension would require.
+
+  Why coarse-grained locking is correct for the current architecture:
+
+    Three data structures are shared across all entries and cannot be
+    independently locked without additional protocol complexity:
+
+      Central Directory ( CD )
+          The CD is a single contiguous structure at the end of archive.zip.
+          Every commit() rewrites the CD (INCREMENTAL: appends a new CD;
+          FULL: writes a new CD in the compacted file).  Concurrent writers
+          targeting different entries both need to update the CD; without
+          a CD-level lock, their updates would interleave destructively.
+
+      .vmdirty journal
+          The spill journal is append-only and single-writer.  Concurrent
+          dirty sessions from different processes cannot safely share a
+          single .vmdirty file under the current record format.  Supporting
+          concurrent writers would require either per-writer journal files
+          with a merge protocol at commit time, or a multi-writer journal
+          format with sequence namespacing per writer.
+
+      .vmidx seek index
+          Index updates on commit are per-entry, but the index file header
+          (fingerprint, archive metadata) is shared.  Concurrent index
+          updates require either a readers-writer lock on the index file or
+          a copy-on-write update protocol.
+
+  Viable approach for a fine-grained extension:
+
+    1. Shard the entry namespace into G shards (e.g., by hash of entry path).
+       Each shard has its own .vmlock_N file.  Writers acquire LOCK_EX only
+       on the shards containing their target entries; readers acquire LOCK_SH
+       on the same shards.
+
+    2. Add a CD lock ( .vmlock_cd ), separate from entry shard locks.
+       Writers acquire LOCK_EX on .vmlock_cd only during the CD-write phase
+       of commit(), not for the entire session.  This reduces CD contention
+       to the duration of the CD write, not the entire work unit.
+
+    3. Per-writer .vmdirty files ( .vmdirty_<writer_id> ).
+       Each concurrent writer spills to its own journal.  At commit time,
+       the writer merges its journal into the archive and deletes the file.
+       Recovery discovers all .vmdirty_* files and replays them in order
+       of their embedded sequence numbers.
+
+    4. .vmidx shard files ( .vmidx_N ) corresponding to entry shards.
+       Each shard's index is updated independently.  A global index header
+       file ( .vmidx_header ) is updated under a short exclusive lock at
+       commit() completion.
+
+  API changes required:
+
+    - mount() would accept an entry_set parameter specifying which entries
+      the session will access.  The VMM derives the required shard locks
+      from this set.
+    - commit() would need to support partial commit: committing only the
+      entries modified in the current session, with per-shard CD updates
+      serialised by the CD lock.
+    - CommitHandle would expose per-entry commit status.
+    - open() with overlapping entry sets from concurrent writers would
+      block on shard-level LOCK_EX, not archive-level LOCK_EX.
+
+  Compatibility with the current design:
+
+    A fine-grained implementation can be backward-compatible: archives
+    without shard index files are treated as a single shard (G=1),
+    which reduces to the current coarse-grained behaviour.  The
+    LockProvider interface requires no changes; each shard instantiates
+    its own LockProvider for its .vmlock_N file.
+
+  This extension is not part of the current implementation.  The current
+  design satisfies all workloads within the stated use case scope.  The
+  constraints described above are the minimum requirements that any
+  fine-grained extension must address to maintain the correctness
+  guarantees of the existing crash safety and recovery model.
