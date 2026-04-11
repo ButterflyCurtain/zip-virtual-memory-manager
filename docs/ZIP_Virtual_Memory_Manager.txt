@@ -14,6 +14,30 @@
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PLATFORM ASSUMPTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  This specification is written against POSIX semantics.  The following
+  primitives are load-bearing for the correctness arguments in this
+  document:
+
+    rename(2)        atomic file replacement       ( FULL commit )
+    flock(2)         advisory locking              ( .vmlock protocol )
+    fdatasync(2)     durable write barrier         ( commit / flush ordering )
+    stat(2) st_ino   file identity                 ( ESTALE fingerprint )
+    mmap(2)          shared read-only mapping      ( vmidx access )
+
+  Ports to non-POSIX platforms must substitute primitives with equivalent
+  guarantees.  On Windows: MoveFileEx(MOVEFILE_REPLACE_EXISTING) or
+  ReplaceFile for atomic replacement; LockFileEx for advisory locking;
+  FlushFileBuffers as the durability barrier; volume serial number plus
+  file index from GetFileInformationByHandle in place of st_ino;
+  MapViewOfFile for mapping.  Where a platform's rename is not atomic
+  with respect to concurrent readers, the FULL commit crash-safety
+  argument must be re-validated for that platform.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   LAYER OVERVIEW
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -62,7 +86,7 @@
 │   Built on first open.  Stored as a sidecar file alongside archive.zip.     │
 │   Rebuilt only when the source ZIP changes.                                  │
 │                                                                              │
-│   entry: file_b                                                              │
+│   entry: file_b  ( compression method: DEFLATE )                            │
 │   compressed_stream:                                                         │
 │   [════════════════════════════════════════════════════════════════════]     │
 │    ↑         ↑         ↑         ↑         ↑         ↑         ↑            │
@@ -73,12 +97,20 @@
 │     - compressed_offset   : byte position in the DEFLATE stream              │
 │     - uncompressed_offset : corresponding byte in expanded output            │
 │     - decoder_state       : DEFLATE sliding window snapshot (32 KB)          │
+│                             [ omitted for VMM-native DEFLATE and Zstandard ] │
 │                                                                              │
-│   Random access to uncompressed offset X:                                    │
+│   For STORE entries: no checkpoints are stored.  Random access is           │
+│   direct arithmetic ( local_data_offset + byte_offset ).                    │
+│                                                                              │
+│   Random access to uncompressed offset X (DEFLATE):                         │
 │     1. Find nearest CP where CP.uncompressed_offset ≤ X                      │
 │     2. Restore decoder state from that CP                                    │
 │     3. Decompress forward ( X − CP.uncompressed_offset ) bytes only          │
 │     → Worst case: 1 MB of sequential decode, never a full-file decode.      │
+│                                                                              │
+│   All offsets stored in the seek index are 64-bit quantities.               │
+│   ZIP64 archives (entries > 4 GB, archive > 4 GB, > 65 535 entries)        │
+│   are handled without special-casing at this layer.                          │
 └──────────────────────────────┬───────────────────────────────────────────────┘
                                │ seek + partial decode
                                ▼
@@ -86,7 +118,7 @@
 │  LAYER 4 : Source ZIP  ( archive.zip )                                       │
 │                                                                              │
 │   ┌──────────────┬──────────────────────────────┬─────────────────────┐     │
-│   │ Local Header │     DEFLATE stream            │   Central Directory │     │
+│   │ Local Header │     DEFLATE stream           │   Central Directory │     │
 │   │  file_a.txt  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │                     │     │
 │   │  dir/file_b  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │   entry table       │     │
 │   │  file_c.bin  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │                     │     │
@@ -113,10 +145,53 @@
        │       YES → return page data
        │
        └─ Seek Index + Source ZIP:
+               [ESTALE check]  stat() archive.zip; compare st_size + st_ino
+               to stored fingerprint.  Mismatch → ESTALE  ( see SNAPSHOT
+               CONSISTENCY section )
                locate nearest checkpoint ≤ target page
-               decompress forward to target page
-               populate Page Cache
+               decompress forward to target page  ( DEFLATE entries )
+               direct seek to data offset         ( STORE entries )
+               populate Page Cache with target page
+               [Read-ahead] populate Page Cache with next N pages
                return page data
+
+
+  Read-ahead
+
+    When the VMM decompresses a DEFLATE or Zstandard stream to serve a Page
+    Cache miss, the decoder context is established at the nearest preceding
+    checkpoint.  The marginal cost of continuing decompression beyond the
+    target page to prefetch subsequent pages is low: the decoder is already
+    active and each additional page costs one page_size of output.
+
+    The VMM reads ahead N pages beyond the target page on each cache miss,
+    inserting them into the Page Cache at LRU-evictable priority.  A
+    subsequent read() that hits a prefetched page requires no decompression.
+
+    Configuration:
+
+      mount(path)                        read_ahead_pages = 8  (default)
+      mount(path, read_ahead_pages=0)    disable read-ahead
+      mount(path, read_ahead_pages=N)    explicit N
+
+    Read-ahead stops at the entry boundary.  Prefetch never crosses into a
+    different entry.  If a prefetched page is already resident in the Page
+    Cache or Diff Layer, it is skipped without re-decompression.
+
+    Adaptive read-ahead  ( --adaptive-read-ahead, default off ):
+
+      The VMM adjusts N per entry based on observed access patterns.
+      Sequential accesses (each miss near the previous miss in page index)
+      increase N toward read_ahead_max (default: 64).  Spatially uncorrelated
+      accesses decrease N toward 0.  The per-entry N is maintained in memory
+      and resets to the mount-time default at each open().
+
+    STORE entries benefit from read-ahead only through I/O coalescing, not
+    decompression amortisation.  The VMM issues a single pread() covering
+    the target page and the following N pages for STORE entries.
+
+    Prefetched pages do not count against dirty_limit.  They are Page Cache
+    residents and are subject to LRU eviction.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -148,25 +223,402 @@
        │
        ├─ flush() : spill all Tier 1 pages → write COMMIT MARKER → fdatasync()
        │
-       ├─ For each entry in ZIP:
-       │       │
-       │       ├─ [no modified pages in Diff Layer]
-       │       │       └─→ copy compressed block verbatim from source ZIP
-       │       │               ( zero recompression cost )
-       │       │
-       │       └─ [modified pages present in Diff Layer]
-       │               └─→ recompress that entry only
-       │                       ( cost ∝ size of that entry, not whole archive )
+       ├─ Select commit strategy  ( see COMMIT STRATEGY section ):
+       │       bloat below thresholds  →  INCREMENTAL path
+       │       bloat exceeds threshold →  FULL (compaction) path
+       │       force_compact = true    →  FULL (compaction) path
        │
-       ├─ Write result to  archive.new.zip
+       ├─ [INCREMENTAL path]
+       │       For each modified entry:
+       │           recompress entry only  ( cost ∝ that entry, not whole archive )
+       │           check Dead Space Freelist for a reusable hole first
+       │           hole found AND fits → write in-place; update CD offset
+       │           no suitable hole   → append Local File Header + data to EOF
+       │       Append new Central Directory after the new entry data
+       │       fdatasync()
+       │       Append new End of Central Directory (EOCD)
+       │       fdatasync()
+       │           Crash before new EOCD : original EOCD remains last valid EOCD
+       │                                   source ZIP is unchanged
+       │           Crash after  new EOCD : new ZIP is complete and valid
        │
-       ├─ rename( archive.new.zip → archive.zip )       ← POSIX atomic
-       │       Crash before rename : source ZIP survives intact
-       │       Crash after  rename : new ZIP is complete and valid
+       ├─ [VMM-native DEFLATE in-place path]  ( VMM-generated archives only )
+       │       For each modified entry with VMM-native DEFLATE encoding:
+       │           identify dirty blocks via vmidx block map
+       │           recompress each dirty block in isolation
+       │           if recompressed_size ≤ block capacity:
+       │               overwrite in-place; pad remainder to capacity
+       │               no CD update required; no append
+       │           if recompressed_size > capacity (overflow):
+       │               fall back to INCREMENTAL append for that entry
+       │       fdatasync()
+       │       ( See VMM-NATIVE DEFLATE section for full procedure )
+       │
+       ├─ [FULL (compaction) path]
+       │       For each entry in ZIP:
+       │           [no modified pages] → copy compressed block verbatim
+       │                                 ( zero recompression cost )
+       │           [modified pages]    → recompress that entry only
+       │       Write result to  archive.new.zip
+       │       rename( archive.new.zip → archive.zip )     ← POSIX atomic
+       │           Crash before rename : source ZIP survives intact
+       │           Crash after  rename : new ZIP is complete and valid
        │
        ├─ Update archive.zip.vmidx for modified entries only
        │
        └─ Delete archive.zip.vmdirty
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  COMMIT STRATEGY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  commit() selects between write strategies based on archive bloat,
+  mount-time configuration, and archive provenance.
+
+  Bloat tracking:
+
+    The INCREMENTAL commit appends new entry data after the current End of
+    Central Directory, then appends a new Central Directory and EOCD after
+    that.  Each such commit leaves the prior entry versions and prior Central
+    Directory as unreferenced data within the file.  Two metrics track this:
+
+      bloat_bytes = archive_file_size − sum_of_current_entry_compressed_sizes
+                                      − current_CD_size − EOCD_size
+      bloat_ratio = archive_file_size / ( archive_file_size − bloat_bytes )
+
+    These are derived from the Central Directory and require no additional I/O.
+    bloat_bytes and bloat_ratio are updated after each commit.
+
+
+  INCREMENTAL commit  ( default when bloat is below both thresholds )
+
+    Writes only changed entry data.  The archive is extended in-place.
+    No temporary file or rename() is required.
+
+    Procedure:
+
+      1. For each modified entry:
+           Check Dead Space Freelist for a hole ≥
+           sizeof(local_file_header) + recompressed_size.
+           Hole found:  write at hole offset (in-place reuse).
+           No hole:     append at EOF.
+           Record the new offset for use in step 2.
+
+      2. Append a new Central Directory:
+             Modified entries  →  new offsets from step 1
+             Unmodified entries →  original offsets (unchanged)
+
+      3. fdatasync() the extended or modified region.
+
+      4. Append a new End of Central Directory (EOCD).
+
+      5. fdatasync().
+
+    Crash safety:
+
+      ZIP readers locate the authoritative EOCD by scanning backward from EOF
+      for signature 0x504b0506 and validating the embedded CD offset and size
+      fields.  Therefore:
+
+        Crash before step 4 : no new EOCD is present; the original EOCD
+                              remains the last valid EOCD; the archive is
+                              unchanged from the caller's perspective.
+        Crash after step 5  : the new EOCD is present; the archive reflects
+                              the committed changes.
+
+    Disk requirement at commit time:
+      sum of recompressed modified entry sizes only (reduced or eliminated
+      when Dead Space Freelist provides sufficient holes).
+
+
+  FULL (compaction) commit  ( when any bloat threshold is exceeded )
+
+    Produces a minimal archive with no dead space.
+
+    Procedure:
+
+      1. For each entry in the archive:
+             [no modified pages]  →  copy compressed stream verbatim from
+                                     archive.zip  ( zero recompression cost )
+             [modified pages]     →  recompress entry from Diff Layer pages
+
+      2. Write to archive.new.zip.
+
+      3. rename( archive.new.zip → archive.zip )   ← POSIX atomic.
+
+    Crash before rename : archive.zip is unchanged; archive.new.zip is
+                          cleaned up at next open().
+    Crash after  rename : archive.zip is complete and minimal.
+
+    Disk requirement at commit time: current total archive size (for
+    archive.new.zip while it is being written).
+    Post-commit bloat_ratio: 1.0.
+
+
+  Compaction thresholds:
+
+    A FULL commit is triggered when any of the following conditions holds
+    at the time commit() is called:
+
+      (a)  bloat_ratio  ≥  gc_threshold          (ratio-based)
+      (b)  bloat_bytes  ≥  gc_max_bloat_bytes     (absolute-bytes-based)
+      (c)  force_compact = true
+
+    Conditions (a) and (b) are evaluated independently; either alone
+    is sufficient to select the FULL path.
+
+    Default values:
+      gc_threshold        = 2.0         (compact when archive doubles)
+      gc_max_bloat_bytes  = unlimited   (no absolute byte limit by default)
+
+
+  Background FULL compaction
+
+    Background compaction initiates the FULL commit path on a background
+    thread and returns immediately.  New write()s accepted during the
+    build phase accumulate in .vmdirty normally.  See BACKGROUND COMMIT
+    for the full specification of the background commit mechanism, which
+    uses an identical implementation.
+
+    Background compaction is triggered automatically when:
+      (a) any bloat threshold is exceeded, AND
+      (b) mount(path, background_compact=true) is active
+
+    The mount remains in DIRTY state throughout.  The caller continues
+    writing without interruption.  On completion, the merge and rename
+    sequence described in BACKGROUND COMMIT is applied.
+
+    mount(path, background_compact=true,
+               gc_threshold=1.5)     automatic background compaction
+                                     at ratio 1.5; no caller involvement
+
+
+  Strategy selection:
+
+    mount(path)                                  incremental by default
+    mount(path, gc_threshold=N)                  compact when bloat_ratio ≥ N
+    mount(path, gc_max_bloat_bytes=N)            compact when bloat_bytes ≥ N
+    mount(path, gc_threshold=unlimited)          never compact on ratio alone
+    mount(path, commit_strategy=FULL)            always full rewrite
+    mount(path, background_compact=true)         automatic background compaction
+    commit(force_compact=true)                   one-off FULL commit (sync)
+    commit(mode=BACKGROUND)                      background FULL commit
+
+  compact() call:
+
+    compact() may be called from CLEAN state to eliminate accumulated dead
+    space without requiring a preceding write().  It performs a FULL
+    (compaction) commit with no dirty pages.  compact() is not permitted on
+    a DIRTY mount; call commit() first.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  DEAD SPACE FREELIST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Each INCREMENTAL commit that appends new entry data leaves the prior version
+  of the entry as unreferenced bytes in archive.zip.  Over multiple commits
+  these accumulate as dead space.  The Dead Space Freelist allows subsequent
+  INCREMENTAL commits to reuse dead regions in-place rather than always
+  appending to EOF, reducing bloat growth between FULL compactions.
+
+  Freelist construction:
+
+    The freelist is built in-memory at open() from the Central Directory.
+
+    1. Collect all allocated regions: for each entry, the region is
+         [ local_header_offset, local_header_offset + sizeof(LFH)
+           + filename_len + extra_len + compressed_size )
+    2. Sort regions by start offset.
+    3. Identify gaps between adjacent regions.  A gap is a free hole:
+         hole.offset = prior_region.end
+         hole.size   = next_region.start − prior_region.end
+       Gaps smaller than sizeof(LocalFileHeader) + 1 are not tracked.
+    4. Insert holes into a size-indexed data structure for O(log n) lookup.
+
+    The freelist is not persisted.  It is reconstructed at each open() from
+    the Central Directory, which is authoritative.  No sidecar file is added.
+
+  Allocation policy:
+
+    The VMM uses smallest-fit-first: the smallest hole whose size ≥
+    required_size is selected.  This minimises wasted space per allocation.
+
+    Required size for an entry:
+      sizeof(LocalFileHeader) + entry.filename_len + extra_len + compressed_size
+
+    If no hole is large enough, the entry is appended to EOF (standard
+    INCREMENTAL behaviour).
+
+  Write procedure (hole reuse):
+
+    1. Write new Local File Header at hole.offset.
+    2. Write recompressed data immediately after.
+    3. If hole.size > required_size:
+         remainder = hole.size − required_size
+         If remainder ≥ sizeof(LocalFileHeader) + 1:
+           track remainder as a new (smaller) hole in the freelist.
+         Else:
+           remainder bytes are internal dead space; counted in bloat_bytes.
+    4. Remove used hole from freelist.
+    5. After commit, add the old entry offset to the freelist as a new hole.
+
+  Freelist coherence across commits:
+
+    After each INCREMENTAL commit:
+      - Holes consumed by step 4 are removed.
+      - Old entry positions released by step 5 are added.
+    The freelist remains accurate for the duration of the mount session.
+    At next open(), it is rebuilt from the updated Central Directory.
+
+  Fragmentation:
+
+    Freelist-based reuse reduces bloat growth but does not eliminate it.
+    When many small holes exist but no single hole fits a new entry, the
+    INCREMENTAL path falls back to append.  FULL compaction remains the
+    authoritative defragmentation mechanism; it eliminates all dead space
+    regardless of fragmentation pattern.
+
+  Interaction with bloat metrics:
+
+    bloat_bytes is computed from the Central Directory regardless of
+    freelist state.  In-place writes that exactly fill a hole do not
+    increase bloat_bytes.  Partial fills increase bloat_bytes by the
+    remainder.  The compaction threshold evaluation is unchanged.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  BACKGROUND COMMIT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  commit(mode=BACKGROUND) initiates a FULL compaction on a background thread
+  and returns a CommitHandle immediately.  The mount remains in DIRTY state
+  throughout; write(), read(), and flush() are accepted without interruption.
+
+  Without background commit, the only mechanism for removing dead space is
+  synchronous FULL compaction, which blocks the caller for the duration of a
+  full archive rewrite.  Background commit resolves this asymmetry: the
+  .vmdirty journal already has background compaction (Section 10 of the
+  vmdirty Journal Specification); background commit brings equivalent
+  non-blocking behaviour to the ZIP itself.
+
+  Phases:
+
+    1. SNAPSHOT
+         The VMM records snapshot_boundary = the highest sequence_num
+         currently present in .vmdirty (or 0 if no spill has occurred).
+         All dirty pages in Tier 1 and Tier 2 with sequence ≤
+         snapshot_boundary constitute the snapshot set S.
+         Pages with sequence > snapshot_boundary constitute the delta
+         set D, which grows as new write()s arrive during the BUILD phase.
+
+    2. BUILD  (background thread)
+         The background thread constructs archive.new.zip from:
+           - archive.zip  (source; read-only, shared with foreground)
+           - Pages in S    (from Tier 1 and Tier 2)
+         The foreground continues to accept write()s.  New dirty pages
+         (sequence > snapshot_boundary) accumulate in Tier 1 and Tier 2
+         as normal.  They do not interfere with the background thread
+         reading S.
+
+    3. MERGE  (on BUILD completion, brief foreground synchronisation)
+         On BUILD completion the background thread notifies the VMM core.
+         The VMM acquires the write mutex to capture a consistent view of D.
+         D = all dirty pages with sequence > snapshot_boundary, now bounded
+         by the write rate × BUILD duration.
+         D pages are applied to archive.new.zip:
+           For each entry with dirty pages in D:
+             append Local File Header + recompressed data to archive.new.zip
+         Append new Central Directory + EOCD to archive.new.zip.
+         The write mutex is released.  New write()s resume.
+
+    4. RENAME
+         rename(archive.new.zip → archive.zip)   ← POSIX atomic.
+         All dirty state through D is now contained in archive.zip.
+         Clear Diff Layer (Tier 1 + Tier 2); delete .vmdirty.
+         Update .vmidx for all modified entries.
+         Mount transitions to CLEAN.
+
+  The MERGE step's pause duration is proportional to D's size.  Background
+  commit is most effective when the write rate during BUILD is moderate.
+  For archives with sustained high write rates, synchronous FULL commit
+  or a lower gc_threshold (triggering more frequent background compactions)
+  may be preferable.
+
+  Post-commit bloat:
+
+    The MERGE step appends D entries after the BUILD output; the S-time
+    versions of those entries remain in archive.new.zip as dead space.
+    A background commit therefore completes with bloat_ratio slightly
+    above 1.0, bounded by the compressed size of D.  Only a synchronous
+    FULL commit (or a background commit whose D is empty) yields exactly
+    bloat_ratio = 1.0.
+
+  CommitHandle:
+
+    handle = commit(mode=BACKGROUND)
+
+    handle.wait()
+        Blocks until RENAME completes.
+        Returns CommitStatus: { COMMITTED | FAILED | CANCELLED }.
+
+    handle.cancel()
+        Requests cancellation.
+        BUILD not yet started:     abort; archive.zip unchanged.
+        BUILD in progress:         discard archive.new.zip; mount remains
+                                   DIRTY with S ∪ D intact in .vmdirty.
+        MERGE or RENAME in progress: cancellation is not possible;
+                                   wait() is implied.
+
+    handle.status()
+        Non-blocking poll.  Returns current phase:
+        { SNAPSHOT | BUILDING | MERGING | COMMITTING | COMMITTED
+          | FAILED | CANCELLED }
+
+  Concurrent operations:
+
+    flush() during BUILD:
+        Proceeds normally.  Writes a COMMIT MARKER to .vmdirty covering
+        pages spilled at that moment.  The background thread is unaffected.
+
+    commit(mode=SYNC) while a background commit is active:
+        Returns COMMIT_IN_PROGRESS immediately.
+        The caller must wait for the background commit before issuing
+        a synchronous commit.
+
+    close() while a background commit is active:
+        Waits for BUILD + MERGE + RENAME to complete before releasing
+        the lock and closing.  To close immediately, call handle.cancel()
+        first (subject to the cancellation constraints above).
+
+    Multiple background commits:
+        At most one background commit is active at any time.
+        A second commit(mode=BACKGROUND) returns the existing handle.
+
+  Crash safety:
+
+    Crash during BUILD:
+        archive.zip is unchanged.  archive.new.zip is an orphan and
+        is removed silently at next open().  .vmdirty contains S ∪ D
+        and is fully recoverable via the standard recovery protocol.
+
+    Crash during MERGE:
+        archive.new.zip contains S but not D.  archive.zip is unchanged
+        (RENAME not yet issued).  archive.new.zip orphan is removed at
+        next open().  .vmdirty contains S ∪ D; fully recoverable.
+
+    Crash after RENAME, before .vmdirty deletion:
+        archive.zip is the compacted file containing S ∪ D (applied in
+        MERGE).  .vmdirty may still be present.  Recovery at next open()
+        applies .vmdirty pages to the compacted archive.zip.  This is
+        correct: FULL compaction does not alter logical content; any
+        dirty page from S or D that was already committed to archive.zip
+        results in an idempotent overwrite with the same data.
+
+    In all crash cases: archive.zip is never left in a partially-written
+    state.  Either the original archive survives or the fully compacted
+    archive survives.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -196,6 +648,723 @@
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  COMPRESSION SUPPORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  CompressionProvider interface
+
+    All compression-method-specific logic is encapsulated behind a
+    CompressionProvider interface.  This allows seek behaviour, checkpoint
+    format, and decoder state to vary per method without coupling the Seek
+    Index or the VMM core to any particular algorithm.
+
+    interface CompressionProvider:
+
+        method_code()     → uint16
+            Returns the ZIP compression method code this provider handles.
+
+        build_index(compressed_stream, entry_uncompressed_size)
+                          → CheckpointList
+            Walks the compressed stream sequentially from its start.
+            Emits a checkpoint at each implementation-defined interval.
+            Called once per entry during index construction.
+
+        restore_state(checkpoint) → DecoderState
+            Reconstructs a live decoder context from a stored checkpoint.
+
+        decompress_page(state, skip_bytes, page_size) → (bytes, DecoderState)
+            Advances the decoder by skip_bytes from the state's position,
+            then returns the next page_size bytes of uncompressed output
+            and the updated decoder state.
+
+    A provider is registered with the VMM at library initialisation time.
+    Providers for methods not registered cause the affected entry to be
+    marked UNSUPPORTED_COMPRESSION at open(); other entries in the same
+    archive remain accessible.
+
+  Built-in providers
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  Method              Code  Provider              Seek mechanism          │
+    │  ────────────────    ────  ──────────────────    ──────────────────────  │
+    │  STORE                 0   StoreProvider         Direct arithmetic       │
+    │  DEFLATE               8   DeflateProvider       Checkpoints every 1 MB  │
+    │  DEFLATE (VMM-native)  8   DeflateVmmProvider    Fixed-capacity blocks   │
+    │  Zstandard            93   ZstdProvider          Seekable frame table    │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+  STORE  ( method 0 )
+
+    Uncompressed data begins at a known byte offset within the archive.
+    Random access is:
+
+        data_offset = local_header_offset
+                    + sizeof(local_file_header)
+                    + local_file_header.file_name_length
+                    + local_file_header.extra_field_length
+
+    No checkpoint data is stored in .vmidx for STORE entries.
+    The seek index records the entry as STORE with data_offset only.
+    Read page N:  seek to data_offset + N * page_size, read page_size bytes.
+
+  DEFLATE  ( method 8 )
+
+    Standard DEFLATE as produced by third-party tools.  Checkpoints are
+    recorded every 1 MB of uncompressed output.  Each checkpoint contains:
+
+        compressed_offset    : uint64  position in DEFLATE stream
+        uncompressed_offset  : uint64  corresponding decompressed byte
+        decoder_state        : 32 768 bytes  ( DEFLATE sliding window )
+
+    Total checkpoint size: 32 784 bytes.
+
+  DEFLATE — VMM-native variant  ( method 8, provenance flag set )
+
+    VMM-native DEFLATE uses Z_FULL_FLUSH at block boundaries, making each
+    block independently decodable.  No cross-block dictionary state is
+    required.  Checkpoints contain:
+
+        compressed_offset    : uint64  byte position of block start
+        uncompressed_offset  : uint64  first decompressed byte of block
+        capacity             : uint64  allocated slot size in bytes
+
+    Total checkpoint size: 24 bytes.  No decoder_state field.
+
+    Full specification of VMM-native DEFLATE encoding, in-place commit
+    procedure, and capacity management: see VMM-NATIVE DEFLATE section.
+
+  Zstandard  ( method 93 )
+
+    Zstandard uses the Zstandard Seekable Format: the compressed stream
+    for an entry consists of a series of independent Zstandard frames
+    followed by a Seek Table embedded in a Zstandard skippable frame
+    (magic 0x184D2A5E) at the end of the stream.  Each data frame is
+    independently decodable; no cross-frame dictionary state is required.
+
+    Index construction:
+
+      build_index() reads the Seek Table from the end of the compressed
+      stream in a single backward scan:
+        1. Seek to end of compressed stream.
+        2. Read skippable frame header; validate magic 0x184D2A5E.
+        3. Parse Seek Table: array of (compressed_size, decompressed_size)
+           pairs, one per frame, plus a footer with frame_count.
+        4. Compute cumulative offsets to produce checkpoints:
+             frame_offset[0]        = 0
+             frame_offset[i]        = frame_offset[i-1] + compressed_size[i-1]
+             uncompressed_offset[i] = uncompressed_offset[i-1]
+                                    + decompressed_size[i-1]
+        5. Write one checkpoint per frame to .vmidx.
+
+      build_index() for Zstandard is O(num_frames), not O(stream_length).
+      There is no forward stream walk.
+
+    Checkpoint format:
+
+        frame_offset         : uint64  byte position of the frame header
+        uncompressed_offset  : uint64  first uncompressed byte of this frame
+
+      Total checkpoint size: 16 bytes.  No decoder_state field.
+
+    Random access procedure:
+
+      1. Look up frame_offset and uncompressed_offset for the frame
+         containing the target offset.
+      2. Seek to frame_offset in the archive.
+      3. Decompress the entire frame (at most one full frame).
+      4. Slice out the target bytes.
+
+      Access cost per miss: at most one full frame decode.
+      Default frame size in VMM-generated archives: 1 MB uncompressed.
+      Worst-case decode distance: 1 MB, comparable to DEFLATE at 1 MB
+      checkpoint interval — but without the 32 KB sliding window overhead
+      and without a stream walk at index-build time.
+
+    vmidx footprint comparison at equivalent checkpoint density:
+
+        Standard DEFLATE   :  32 784 bytes / checkpoint
+        VMM-native DEFLATE :      24 bytes / checkpoint
+        Zstandard          :      16 bytes / checkpoint
+
+      For a 100 GB entry at 1 MB intervals:
+        Standard DEFLATE   :  ~3.0 GB of vmidx
+        VMM-native DEFLATE :  ~2.2 MB of vmidx
+        Zstandard          :  ~1.5 MB of vmidx
+
+    Frame size configuration:
+
+      ZstdProvider generates frames of uncompressed_frame_size bytes.
+      Smaller frames reduce worst-case access cost but increase the
+      number of frames and the Seek Table size.
+
+        mount(path)                          frame_size = 1 MB  (default)
+        mount(path, zstd_frame_size=128KB)   finer granularity; smaller
+                                             worst-case decode cost
+        mount(path, zstd_frame_size=4MB)     coarser; fewer frames;
+                                             larger decode cost per miss
+
+      Frame size is written into each frame's Zstandard header and
+      recorded in .vmidx.  Third-party Zstandard decoders read the
+      seekable stream correctly regardless of frame size.
+
+    Non-seekable Zstandard entries:
+
+      A Zstandard entry without a Seek Table (produced by a third-party
+      tool) is treated by ZstdProvider as a single frame.  build_index()
+      records one checkpoint at offset 0.  Random access requires full
+      decompression of the entry.  The VMM logs a diagnostic message
+      at mount time for each such entry.  On the next FULL commit where
+      ZstdProvider is active, the entry is rewritten in seekable format.
+
+    Until a ZstdProvider is registered, method 93 entries return
+    UNSUPPORTED_COMPRESSION.
+
+  Other unsupported methods
+
+    DEFLATE64 (9), BZIP2 (12), LZMA (14), and all other method codes with
+    no registered provider cause open() to return UNSUPPORTED_COMPRESSION
+    for the affected entry.  Entries with supported methods in the same
+    archive remain accessible; only the unsupported entries are unavailable.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SEEK INDEX SIZING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The seek index (.vmidx) is the primary factor governing random access cost
+  and memory use at mount time.  Checkpoint density, checkpoint size, and
+  archive volume interact to determine both the worst-case seek distance and
+  the index footprint.
+
+  Checkpoint size by provider:
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  Provider              Checkpoint size  Components                   │
+    │  ──────────────────    ───────────────  ────────────────────────     │
+    │  STORE                 0 bytes          (direct arithmetic; no CPs)  │
+    │  Standard DEFLATE      32 784 bytes     offsets(16) + window(32768)  │
+    │  VMM-native DEFLATE        24 bytes     offsets(16) + capacity(8)    │
+    │  Zstandard                 16 bytes     offsets(16)                  │
+    └──────────────────────────────────────────────────────────────────────┘
+
+  vmidx size formula:
+
+    vmidx_bytes ≈ Σ_entries ( ceil(uncompressed_size / interval) × cp_size )
+
+  Representative examples at 1 MB interval:
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  Archive           Provider        vmidx size (approx.)              │
+    │  ───────────────   ─────────────   ────────────────────              │
+    │  100 GB DEFLATE    Standard        ~3.0 GB                           │
+    │  100 GB DEFLATE    VMM-native      ~2.2 MB                           │
+    │  100 GB            Zstandard       ~1.5 MB                           │
+    │   10 GB DEFLATE    Standard        ~300 MB                           │
+    │    1 GB DEFLATE    Standard        ~30 MB                            │
+    └──────────────────────────────────────────────────────────────────────┘
+
+  The 32 KB DEFLATE sliding window snapshot dominates index size for
+  standard DEFLATE archives.  VMM-native DEFLATE and Zstandard eliminate
+  this entirely, reducing the index by three orders of magnitude.
+
+  As a mitigation for standard DEFLATE, window snapshots may themselves be
+  stored compressed inside .vmidx (zlib level 1).  Window content typically
+  compresses to roughly half its size, at the cost of one additional
+  decompression on each checkpoint restore.  This is an .vmidx-internal
+  representation choice; the checkpoint logical format is unchanged.
+
+  Checkpoint interval and access cost:
+
+    Worst-case seek cost for a page miss is proportional to the interval:
+    at 1 MB intervals, at most 1 MB of DEFLATE must be decoded forward
+    from the nearest checkpoint.  Smaller intervals reduce decode cost
+    but increase index size proportionally.
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  Interval  Worst-case seek   Standard DEFLATE   VMM-native / Zstd   │
+    │  ────────  ───────────────   ────────────────   ──────────────────── │
+    │  256 KB    256 KB decode     ~48 KB / CP        ~4–6 bytes / CP      │
+    │  512 KB    512 KB decode     ~16 KB / CP        ~4–6 bytes / CP      │
+    │    1 MB      1 MB decode     ~32 KB / CP        ~4–6 bytes / CP      │
+    │    2 MB      2 MB decode     ~64 KB / CP        ~4–6 bytes / CP      │
+    │    4 MB      4 MB decode     ~128 KB / CP       ~4–6 bytes / CP      │
+    └──────────────────────────────────────────────────────────────────────┘
+
+  Use-case guidelines:
+
+    Batch sequential workload (streaming reads, sequential writes):
+        1 MB interval (default).
+        vmidx for standard DEFLATE may reach several GB for large archives.
+        Consider VMM-native DEFLATE or Zstandard to reduce index footprint.
+
+    Random access intensive (frequent seek to arbitrary offsets):
+        256–512 KB interval.
+        Smaller interval yields faster worst-case access at the cost of
+        a proportionally larger index.
+        Zstandard with 256 KB frames is preferred: same access cost,
+        negligible index size, no sliding window overhead.
+
+    Memory-constrained environment:
+        2 MB or larger interval.
+        Accepts up to 2 MB of sequential decode per cold miss.
+        For standard DEFLATE: a 10 GB archive at 2 MB uses ~150 MB of vmidx.
+
+    Distributed archive (archive.zip is read-only, AOT vmidx):
+        Generate vmidx offline with --index-strategy=eager.
+        Distribute .vmidx alongside archive.zip.
+        At 1 MB interval with Zstandard: vmidx is ~1.5 MB for a 100 GB archive.
+        At 1 MB interval with standard DEFLATE: ~3 GB — distribute via
+        a compressed channel or prefer VMM-native on new archives.
+
+    Configuration:
+
+      mount(path, checkpoint_interval=N)    set interval in uncompressed bytes
+                                            default: 1 MB (1 048 576 bytes)
+
+  Behaviour when vmidx does not fit in RAM:
+
+    The .vmidx file is mapped into the process address space via mmap() with
+    PROT_READ and MAP_SHARED.  madvise(MADV_RANDOM) is applied: the OS is
+    informed that access is non-sequential so it does not prefetch
+    sequentially within the mapping.
+
+    When vmidx > available RAM:
+
+      The OS manages paging of the vmidx mapping through the kernel's page
+      cache.  Access to a cold checkpoint incurs a page fault and an
+      additional I/O to the vmidx file.  The overhead is typically
+      sub-millisecond on NVMe storage.
+
+      The in-memory index (VmdirtyIndex, per-entry access counters, hot-
+      entry tables) is kept separate from the mmap'd region and is bounded
+      in size by the number of unique dirty pages and hot entries, not by
+      the total vmidx size.
+
+      For standard DEFLATE archives where vmidx reaches several gigabytes,
+      access patterns that touch many entries across the index will incur
+      frequent page faults.  In such configurations:
+
+        (a) Prefer VMM-native DEFLATE or Zstandard to reduce index size by
+            three orders of magnitude.
+        (b) Use LAZY or BACKGROUND index strategy so the index is populated
+            incrementally; cold regions are never faulted unless accessed.
+        (c) Use large checkpoint intervals (2–4 MB) to reduce index size at
+            the cost of higher per-miss decode latency.
+
+    mmap() is the only supported access mode.  The VMM does not implement
+    a manual paging layer; OS-level page cache management is relied upon.
+
+  Adaptive checkpointing:
+
+    For archives whose access pattern is known to concentrate on a subset
+    of entries, adaptive checkpointing selectively reduces the checkpoint
+    interval for frequently-accessed (hot) entries, increasing the density
+    of their index coverage without increasing the interval globally.
+
+    Hot entry detection:
+
+      The VMM counts Page Cache misses per entry.  The miss count is
+      maintained in memory and flushed to the .vmidx per-entry header
+      at close().  On subsequent opens, the persisted count initialises
+      the in-memory counter.
+
+      An entry becomes hot when:
+          accumulated_miss_count > hot_entry_threshold
+          default: hot_entry_threshold = 100 misses
+
+    Adaptive re-indexing:
+
+      When BACKGROUND index strategy is active (or when the VMM has an
+      idle background thread), a background re-index pass runs for hot
+      entries using the adaptive interval:
+
+          adaptive_interval = base_interval / adaptive_ratio
+          default: adaptive_ratio = 4  →  256 KB when base is 1 MB
+
+      The re-index pass walks the DEFLATE stream for the hot entry from
+      the first checkpoint and generates additional checkpoints at every
+      adaptive_interval bytes.  New checkpoints are inserted into the
+      existing checkpoint list in .vmidx (which supports variable-density
+      per-entry lists without format changes).
+
+      After re-indexing, the worst-case seek cost for the hot entry drops
+      from base_interval to adaptive_interval.
+
+    vmidx size impact:
+
+      Adaptive checkpointing increases vmidx size for hot entries.  The
+      additional checkpoints are bounded by:
+
+          additional_bytes = (hot_entry_count × uncompressed_size_per_entry
+                              / adaptive_interval − base checkpoints) × cp_size
+
+      For standard DEFLATE at 4× density increase on 10 hot entries of
+      1 GB each: additional ~10 × (1024 − 256) × 32 784 ≈ 240 MB.
+
+      For VMM-native DEFLATE or Zstandard the per-checkpoint overhead is
+      negligible regardless of density.
+
+    mount(path, adaptive_checkpointing=true,
+               hot_entry_threshold=50,
+               adaptive_ratio=8)     custom adaptive configuration
+
+    mount(path, adaptive_checkpointing=false)
+                                     disable (default for standard archives)
+
+    Adaptive re-indexing is deferred and does not block foreground reads.
+    If the re-index pass has not completed for a hot entry, reads use the
+    original coarser checkpoint density for that access.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  VMM-NATIVE DEFLATE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Standard DEFLATE maintains a 32 KB sliding window dictionary across the
+  entire compressed stream.  A checkpoint at offset X requires snapshotting
+  that full 32 KB dictionary state.  When a page within a block is modified
+  and committed, the entire block must be recompressed from the start (or
+  from the nearest checkpoint), because the dictionary context at the
+  modification point depends on all preceding data in the stream.
+
+  VMM-native DEFLATE resolves this by using Z_FULL_FLUSH at fixed block
+  boundaries during archive generation.  Z_FULL_FLUSH emits a complete
+  DEFLATE end-of-block marker and resets the LZ77 dictionary.  Each block
+  is independently decodable from its first byte; no context from prior
+  blocks is required.
+
+  Properties:
+
+    - No cross-block dictionary dependency.
+    - Modified blocks are recompressed in complete isolation, covering only
+      the pages within that block.
+    - Checkpoints contain (compressed_offset, uncompressed_offset, capacity)
+      only; no 32 KB decoder_state field.  Checkpoint size: 24 bytes.
+    - In-place overwrite: if the recompressed block fits within its
+      allocated capacity slot, it is written at the original byte offset.
+      No append to EOF.  No Central Directory update.  No rename.
+    - The on-disk encoding is standard DEFLATE and is readable by any
+      third-party tool without modification.
+
+  Compression ratio tradeoff:
+
+    Z_FULL_FLUSH prevents the compressor from matching strings across block
+    boundaries.  At 1 MB block size the compression ratio penalty is
+    empirically 2–8% for heterogeneous data.  At 256 KB: 5–15%.  Archives
+    intended for distribution where download size dominates should use
+    standard DEFLATE or Zstandard.  VMM-native DEFLATE is preferred when
+    commit latency or commit CPU cost is the primary concern.
+
+  Applicability:
+
+    VMM-native DEFLATE is produced only when:
+      (a) The commit path is FULL (compaction), AND
+      (b) The archive was last fully rewritten by the VMM (identified by a
+          VMM provenance flag in the .vmidx per-archive header), AND
+      (c) The mount option --vmm-native is active (default for new archives
+          created via the VMM; opt-in for externally produced archives).
+
+    Archives from third-party sources use standard DEFLATE.  The VMM reads
+    them correctly via DeflateProvider.  They are not converted to
+    VMM-native format unless a FULL commit with --vmm-native is explicitly
+    requested.
+
+  Block layout:
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  Entry compressed stream (VMM-native)                                   │
+    │                                                                         │
+    │  [ BLOCK 0              ][ BLOCK 1              ][ BLOCK 2   ... ]      │
+    │   compressed  │ padding   compressed  │ padding   compressed │ padding  │
+    │   data        │           data        │           data        │          │
+    │   ←─── capacity[0] ────→  ←─── capacity[1] ────→                        │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+    Each block covers exactly block_size bytes of uncompressed data (default
+    1 MB, configurable at mount time; the last block may be smaller).
+    capacity[i] is the total byte slot allocated for block i in the archive.
+
+  Capacity and padding:
+
+    capacity[i] is computed at block-generation time as:
+        capacity[i] = ceil( compressed_size / CAPACITY_ALIGN ) × CAPACITY_ALIGN
+        default CAPACITY_ALIGN = 512 bytes
+
+    No additional headroom is added at generation.  The expectation is that
+    subsequent modifications compress to a similar or smaller size.
+
+    Padding bytes fill the difference between the actual compressed data and
+    the capacity boundary.  Interior padding must be parseable: a sequential
+    decoder reads through it to reach the next block.  Padding is therefore
+    encoded as EMPTY non-final stored blocks (BTYPE=00, LEN=0; the
+    00 00 FF FF form).  An empty stored block emits no uncompressed output.
+    A stored block with non-zero LEN is NOT valid padding: its payload
+    would be emitted into the decompressed stream and corrupt the entry.
+
+    Granularity constraint:
+
+      An empty stored block written from a byte-aligned position occupies
+      exactly 5 bytes and leaves the stream byte-aligned.  Combined with
+      empty fixed-Huffman blocks (10 bits each) for bit-phase adjustment,
+      the tileable gap sizes are { 0, 5, 6, 7 } and every size >= 9 bytes.
+      Residual gaps of 1-4 or exactly 8 bytes cannot be tiled.
+
+      When recompression leaves an untileable residual, the writer extends
+      the compressed data itself with empty fixed-Huffman blocks
+      (Z_PARTIAL_FLUSH) to shift the gap into the tileable set.  If no
+      adjustment within the capacity slot succeeds, the block is treated
+      as an overflow and falls back to INCREMENTAL append (step 2d of the
+      in-place commit procedure).
+
+    The final block of the entry carries the DEFLATE end-of-stream marker
+    (BFINAL=1) after the last padding run, ensuring the entry validates as
+    a complete, conformant DEFLATE stream.
+
+  In-place commit procedure:
+
+    1. Identify all blocks that contain at least one dirty page, using the
+       vmidx block map: (block_index → compressed_offset, capacity).
+
+    2. For each dirty block:
+         a. Recompress all pages in the block using Z_FULL_FLUSH.
+         b. Measure recompressed_size.
+         c. If recompressed_size ≤ capacity[block]:
+                Write recompressed data at compressed_offset[block].
+                Pad remaining (capacity − recompressed_size) bytes.
+                No CD update.  No append.
+         d. If recompressed_size > capacity[block]  ( overflow ):
+                Mark block as OVERFLOW in vmidx.
+                Fall back to INCREMENTAL append for the affected entry:
+                  write all blocks of the entry contiguously at EOF
+                  (unchanged blocks copied verbatim; overflowed block
+                  written with its new, larger compressed data; no
+                  Z_FULL_FLUSH structure change).
+                  Update Central Directory with new entry offset.
+                  Old entry position becomes a dead-space hole in the
+                  Dead Space Freelist.
+
+    3. fdatasync() after all in-place writes and any INCREMENTAL fallback.
+
+    4. Update .vmidx: new capacity values for blocks that were recompressed
+       in-place; new entry offset for any entries that fell back.
+
+    No EOCD rewrite is needed unless step 2d triggered a CD update.
+
+  Overflow management:
+
+    Overflow is uncommon because modifications to similar data tend to
+    compress to similar or smaller sizes.  When overflow occurs repeatedly:
+
+      - If a block overflows more than 3 times in 10 consecutive commits,
+        the VMM increases capacity[block] by a headroom_factor (default: 1.25)
+        on the next FULL compaction pass.  The block is allocated more space,
+        reducing future overflow probability.
+
+      - If overflow events for the same entry total more than 3 in 10 commits
+        regardless of block, the entry is a candidate for STORE promotion
+        (see STORE PROMOTION section).
+
+  Capacity shrinkage:
+
+    If recompressed_size < 60% of capacity for 5 consecutive commits on the
+    same block, the VMM marks that block for capacity reduction on the next
+    FULL compaction.  The new capacity is set to
+    ceil(recompressed_size / CAPACITY_ALIGN) × CAPACITY_ALIGN.
+    This prevents perpetual over-allocation as data shrinks over time.
+
+  .vmidx checkpoint type:
+
+    DEFLATE_VMM entries are distinguished from standard DEFLATE entries
+    in the .vmidx per-entry header by a provider_type field.  Checkpoint
+    records for DEFLATE_VMM entries carry (compressed_offset,
+    uncompressed_offset, capacity); they carry no decoder_state bytes.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  STORE PROMOTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Every commit() that rewrites a DEFLATE entry recompresses its modified
+  pages, regardless of how many times the entry has been modified before.
+  For entries that are written frequently, this CPU cost compounds across
+  commits.  STORE promotion converts such an entry to method=0 (STORE,
+  uncompressed), eliminating compression from all subsequent commits.
+  Post-promotion commit cost for the entry is I/O only.
+
+  Trigger conditions:
+
+    Automatic — commit frequency:
+        commit_count_for_entry ≥ store_promote_threshold
+        Default store_promote_threshold = 5
+
+        commit_count_for_entry counts commits that modified the entry,
+        not total mounts or total commits to the archive.  It is tracked
+        in the .vmidx per-entry header and survives across sessions.
+
+    Automatic — overflow frequency:
+        Overflow events in VMM-native DEFLATE exceed 3 in 10 commits for
+        the same entry (see VMM-NATIVE DEFLATE — overflow management).
+        The VMM promotes the entry on the next FULL compaction rather than
+        continuing to fall back to INCREMENTAL append on each overflow.
+
+    Manual:
+        mount(path, store_entries=["path/to/entry", ...])
+        Forces STORE for specified entries on the next FULL commit,
+        regardless of commit_count_for_entry.
+
+  Promotion procedure:
+
+    Promotion is performed on the next FULL (compaction) commit after the
+    trigger condition is met.  Promotion is not performed during an
+    INCREMENTAL commit: INCREMENTAL cannot rewrite an entry at its current
+    offset in general.
+
+    During FULL commit:
+      1. The entry is written with method=0 (STORE).  Local File Header
+         records method=0; data is the raw uncompressed bytes.
+      2. .vmidx updated: provider_type = STORE; data_offset recorded.
+         commit_count_for_entry reset to 0.  store_promoted flag set.
+
+    Subsequent commits of a STORE-promoted entry:
+
+      INCREMENTAL commit:
+          Raw bytes written directly; no compression step.
+          The new entry is appended (or placed via Dead Space Freelist)
+          as a STORE entry.
+          Cost: I/O proportional to entry size; zero CPU recompression.
+
+      VMM-native in-place (same-size write):
+          If the entry size is unchanged, write the new raw bytes directly
+          at data_offset + page_offset × page_size.
+          No CD update.  Zero recompression and minimal I/O.
+
+  Tradeoffs:
+
+    ZIP file size increases by the compression ratio formerly achieved.
+    A 300 MB uncompressed entry that was stored as 100 MB DEFLATE becomes
+    300 MB as STORE.  Third-party tools read STORE entries without any
+    special handling.  Random access to STORE entries is O(1) and requires
+    no decompression at any point in the read path.
+
+    STORE promotion is appropriate for:
+      - Entries already in a compressed format (images, video, other ZIPs).
+      - Entries with high write frequency relative to read frequency.
+      - Entries in environments where CPU time is more constrained than
+        storage capacity.
+
+  Demotion:
+
+    A STORE-promoted entry is not automatically reverted to DEFLATE.
+    Demotion requires an explicit mount option:
+      mount(path, deflate_entries=["path/to/entry"])
+    The entry is recompressed to DEFLATE on the next FULL commit.
+    commit_count_for_entry is reset and the store_promoted flag is cleared.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SNAPSHOT CONSISTENCY  ( ESTALE )
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  At open(), the VMM validates the fingerprint of archive.zip and mounts
+  against a consistent view of the archive.  Under concurrent access via
+  the advisory lock, an R/W mount holds LOCK_EX for its entire lifetime,
+  preventing external modification.  An R/O mount holds LOCK_SH, which
+  prevents another VMM mount from acquiring LOCK_EX but does not prevent
+  external processes that do not use the .vmlock protocol from writing to
+  archive.zip.  On NFS or distributed storage, external modification can
+  also occur due to replication or cache staleness.
+
+  ESTALE detection extends fingerprint validation to the runtime read path.
+  On each Page Cache miss the VMM performs a lightweight check before
+  accessing the source archive.  If the archive has changed since mount,
+  the VMM returns ESTALE to the caller rather than reading potentially
+  inconsistent data.
+
+  Check procedure on Page Cache miss:
+
+    1. stat() archive.zip.
+    2. Compare st_size and st_ino to the fingerprint recorded at open().
+    3. If both match: proceed with seek and decompression.
+    4. If either differs:
+         Transition mount to STALE state.
+         Return ESTALE to the caller.
+         All subsequent read() and write() calls return ESTALE until
+         the mount is closed and re-opened.
+
+  The check is O(1): a single stat() syscall, no I/O into the archive.
+  The cost is one syscall per Page Cache miss.  For workloads with a
+  high Page Cache hit rate this overhead is negligible.
+
+  STALE state:
+
+    A mount in STALE state accepts no further read() or write() operations.
+    write() returns ESTALE regardless of Diff Layer state.
+    flush() and commit() return ESTALE.
+    close() proceeds normally and releases the advisory lock.
+    .vmdirty is not deleted on close() from STALE state; it is retained
+    for recovery at the next open().
+
+  Configuration:
+
+    --estale-check-interval=N
+        Check fingerprint every N Page Cache misses rather than on every
+        miss.  Default: 1 (every miss).  Higher values reduce syscall
+        overhead at the cost of delayed ESTALE detection.  N=0 disables
+        ESTALE checking entirely (appropriate when the advisory lock
+        guarantees exclusive access and external modification is impossible).
+
+    --strict-estale
+        On ESTALE detection, also validate the Central Directory hash
+        (cd_hash) before transitioning to STALE state.  Eliminates false
+        positives from inode recycling on filesystems that reuse inodes
+        rapidly.  Adds one O(cd_size) I/O on the detection path only.
+
+  Interaction with R/W mounts:
+
+    An R/W mount holds LOCK_EX.  External modification of archive.zip
+    while LOCK_EX is held is not possible through the VMM protocol.
+    ESTALE detection on R/W mounts guards only against out-of-band
+    modification (tools that bypass the advisory lock).
+
+    If ESTALE is detected on an R/W mount with a non-empty Diff Layer,
+    the dirty pages in Tier 1 and Tier 2 are preserved in .vmdirty.
+    The CONFLICT resolution protocol applies at the next open():
+    the caller decides whether to discard dirty pages or abort.
+
+  Interaction with BACKGROUND COMMIT:
+
+    If ESTALE is detected while a background commit is in progress,
+    the background thread is cancelled (equivalent to handle.cancel()).
+    archive.new.zip is discarded.  archive.zip is unchanged.
+    The mount transitions to STALE state.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ZIP64 SUPPORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The VMM handles ZIP64 extensions transparently.  All internal offsets
+  (compressed position, uncompressed position, local header offset,
+  source_file_size in the .vmidx header) are stored as 64-bit quantities.
+  There is no 4 GB or 65 535-entry limit imposed by the VMM itself.
+
+  Covered cases:
+
+    - Single uncompressed entry size > 4 GB
+    - Single compressed entry size > 4 GB
+    - Archive total size > 4 GB
+    - Entry count > 65 535
+    - Local header offset > 4 GB  ( entry beyond the 4 GB boundary )
+
+  The Central Directory is parsed with full ZIP64 end-of-central-directory
+  locator support.  ZIP64 extra fields in local and central headers are
+  consumed during the DEFLATE Stream Walker pass that builds the .vmidx.
+
+  Non-ZIP64 archives are not affected; the code path is the same with
+  32-bit field promotion to 64-bit.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   FIRST-OPEN INITIALIZATION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -205,12 +1374,15 @@
        │
        ├─ archive.zip.vmidx present and fingerprint valid?
        │       YES → load index, mount immediately
-       │       NO  → run DEFLATE Stream Walker  ( single linear pass )
+       │       NO  → run DEFLATE Stream Walker according to index build strategy
        │                   │
-       │                   │  For each DEFLATE entry:
-       │                   │    Walk stream sequentially from start.
-       │                   │    Every 1 MB of uncompressed output:
-       │                   │      snapshot decoder state → write checkpoint
+       │                   │  For each entry:
+       │                   │    provider = lookup(method_code)
+       │                   │    provider present:
+       │                   │      call provider.build_index(stream)
+       │                   │      write checkpoints to .vmidx
+       │                   │    provider absent:
+       │                   │      record as UNSUPPORTED_COMPRESSION
        │                   │
        │                   └─→ Write archive.zip.vmidx
        │                         ( source ZIP is not modified )
@@ -219,25 +1391,186 @@
        │       YES → run recovery protocol (see vmdirty Journal Specification)
        │       NO  → proceed
        │
+       ├─ Dead Space Freelist construction from Central Directory
+       │
        └─ Mount virtual address space
+
+
+  Index build strategy  ( configured at mount time ):
+
+  The .vmidx format is identical regardless of which strategy produced it.
+  The strategy governs only when checkpoints are generated, not their content.
+
+  EAGER  ( default, --index-strategy=eager )
+
+      The Stream Walker runs in full before mount() returns.
+      All checkpoints are available when the first read() is issued.
+      First-open cost: O( archive_size ).  Subsequent opens: O( vmidx_size ).
+      Suitable for batch workloads or pipelines where first-open latency
+      is acceptable.
+
+  LAZY  ( --index-strategy=lazy )
+
+      open() reads only the Central Directory and returns immediately.
+      Checkpoints are generated on demand as regions are first accessed:
+
+        - On the first read() to an unindexed region, the stream is
+          decompressed forward from the nearest existing checkpoint, writing
+          new checkpoints at every interval along the way.
+        - STORE entries are always immediately accessible.
+        - .vmidx is written incrementally as checkpoints are generated.
+
+      Cost per cold access:  O( distance_from_nearest_checkpoint ).
+      Coverage converges toward completeness as regions are accessed.
+
+  BACKGROUND  ( --index-strategy=background )
+
+      open() reads only the Central Directory and returns immediately.
+      A background thread performs the full Stream Walker pass, writing
+      checkpoints to .vmidx as they are generated.
+      Foreground reads that request an unindexed region fall back to
+      on-demand decompression (identical to LAZY behaviour) until the
+      background thread has covered that region.
+      Background indexing is cancelled on close() or commit().
+      Background indexing also executes adaptive re-index passes for
+      hot entries when adaptive_checkpointing is enabled.
+
+  AOT  ( ahead-of-time )
+
+      .vmidx is pre-generated and distributed alongside archive.zip.
+      open() loads the index with no build cost.
+      Suitable when archive.zip is produced by a controlled build pipeline
+      where the index can be generated during the build step.
+      The fingerprint in the pre-built .vmidx must match the distributed
+      archive.zip; a mismatch causes a rebuild under the active strategy.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CONCURRENT ACCESS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The VMM uses an advisory lock on the sidecar file archive.zip.vmlock
+  to coordinate access when multiple processes open the same archive.
+  Lock acquisition is delegated to a LockProvider, allowing the locking
+  mechanism to be configured per mount without altering VMM semantics.
+
+  Lock modes:
+
+    Read-write mount (default)
+        Acquires LOCK_EX on archive.zip.vmlock.
+        Blocks until all other mounts (read-only and read-write) release.
+        At most one read-write mount may be active at any time.
+
+    Read-only mount  ( --read-only )
+        Acquires LOCK_SH on archive.zip.vmlock.
+        Multiple read-only mounts may coexist.
+        Blocked while any read-write mount holds LOCK_EX.
+
+  The lock is held for the lifetime of the mount and released at close()
+  or on process exit (kernel releases flock() locks automatically).
+  A .vmlock file is created if absent; its presence does not indicate
+  a lock is currently held.
+
+  Full locking semantics, platform behaviour, LockProvider interface,
+  fork() handling, LOCK_EX long-hold impact on R/O mounts, use-case
+  scope, and failure modes are specified in:
+  ZIP_Virtual_Memory_Manager_Concurrent_Access.txt
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   SIDECAR FILES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  All sidecar files live alongside the source archive.
+  Sidecar file set
 
-  archive.zip                   source ZIP (read-only until commit)
-  archive.zip.vmidx             seek index (rebuilt if absent or stale)
-  archive.zip.vmdirty           spill journal (present only during dirty session)
-  archive.zip.vmdirty.bak.{id}  recovered spill journal (retained for forensics)
+    archive.zip                   source ZIP (read-only until commit)
+    archive.zip.vmidx             seek index (rebuilt if absent or stale)
+    archive.zip.vmlock            advisory lock coordination file
+    archive.zip.vmdirty           spill journal (present only during dirty session)
+    archive.zip.vmdirty.bak.{id}  recovered spill journal (retained for forensics)
+    archive.zip.vmdirty.compact   journal compaction scratch file (transient)
+    archive.new.zip               commit scratch file (transient; FULL path only)
 
-  Moving archive.zip to another location requires moving all sidecar files
-  with it to preserve fast-access and recovery capabilities.  A ZIP without
-  its .vmidx is still a valid ZIP; first-open rebuilds the index.  A ZIP
-  without its .vmdirty means any unrecovered dirty pages from a prior session
-  are lost; the source ZIP itself remains intact.
+    archive.zip.vmdirty.compact is present only while a journal compaction is in
+    progress.  A file found at this path at open() time with no active mount is
+    an orphan from an interrupted compaction and is removed silently.
+
+    archive.new.zip is present only while a FULL (compaction) commit is in
+    progress (synchronous or background).  A file found at this path at open()
+    time with no active mount is an orphan from an interrupted full commit
+    and is removed silently.
+
+  Default co-location
+
+    All sidecar files reside in the same directory as archive.zip, using
+    archive.zip's filename as a prefix.  This is the default behaviour when
+    no sidecar_dir is configured.
+
+    Co-location is the default deliberately.  The association between an
+    archive and its sidecar state is physically unambiguous: it does not
+    survive a copy, so two byte-identical copies of an archive can never
+    contend for the same lock file or have one copy's dirty journal applied
+    to the other.  Registry-based recovery (below) matches archives by
+    content fingerprint (file_size + cd_hash); byte-identical copies share
+    a fingerprint, so under sidecar_dir a journal recorded against one copy
+    is recoverable against the other.  Co-location closes that hazard by
+    construction.  This mirrors the convention of SQLite's -wal / -shm
+    sidecar files.
+
+  sidecar_dir mount option
+
+    mount(path, sidecar_dir="/path/to/sidecar/directory")
+
+    All sidecar files are written to the specified directory instead of the
+    directory containing archive.zip.  Within sidecar_dir, each file is
+    named using an 8-character hex prefix derived from a SHA-256 hash of
+    the archive's canonical absolute path, combined with the archive filename:
+
+        {hex8}_{archive_filename}.vmidx
+        {hex8}_{archive_filename}.vmlock
+        {hex8}_{archive_filename}.vmdirty
+        ...
+
+    The hex8 prefix prevents collisions between archives with the same
+    filename in different directories.  The filename component preserves
+    human readability.
+
+    sidecar_dir is suitable when:
+      - The directory containing archive.zip is read-only or on a
+        filesystem that does not support the sidecar file operations
+        (e.g. read-only media, certain network mounts).
+      - Applications prefer to isolate VMM state from user-visible files.
+      - A fixed application-data path is used across archive locations.
+
+  Sidecar registry
+
+    When sidecar_dir is configured, the VMM maintains a registry file at
+    {sidecar_dir}/vmm_registry.  The registry maps archive fingerprints
+    (file_size + cd_hash) to their sidecar prefix within sidecar_dir.
+
+    On open(), the VMM:
+      1. Checks the expected sidecar path in sidecar_dir by canonical path hash.
+      2. If the sidecar set is not found at that path, consults the registry
+         by fingerprint.  A fingerprint match recovers sidecar files even
+         when the archive has been moved or renamed on disk.
+      3. If no match is found in the registry, proceeds as a cold open
+         (rebuilds .vmidx; no prior dirty state).
+
+    The registry is updated on every open() with the current canonical path
+    and fingerprint of the archive being mounted.
+
+  Portability note
+
+    Moving archive.zip to another location requires either:
+      (a) Moving all co-located sidecar files alongside it, or
+      (b) Configuring a stable sidecar_dir so that sidecar files remain
+          accessible at their fixed path; the registry enables fingerprint-
+          based recovery even after the archive path changes.
+
+    A ZIP without its .vmidx is still a valid ZIP; first-open rebuilds the index.
+    A ZIP without its .vmlock is still usable; the file is created at next open().
+    A ZIP without its .vmdirty means any unrecovered dirty pages from a prior
+    session are lost; the source ZIP itself remains intact.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -246,8 +1579,61 @@
 
   Scenario                                           Result
   ─────────────────────────────────────────────────────────────────────────────
-  Open with VMM, .vmidx present and valid           fast random access
+  Open with VMM, .vmidx present and valid            fast random access
   Open with VMM, .vmidx absent or stale             slow first-open, then fast
-  Open with standard unzip / 7-Zip / WinZip         works perfectly (.vmidx ignored)
-  Copy archive.zip without .vmidx to another host   works as a normal ZIP
-  archive.zip modified externally                   .vmidx invalidated; rebuilt on next open
+  Open with standard unzip / 7-Zip / WinZip          works perfectly (.vmidx
+                                                     and .vmlock are ignored)
+  Copy archive.zip without sidecar files             works as a normal ZIP;
+                                                     sidecar_dir registry may
+                                                     recover state by fingerprint
+  archive.zip modified externally                    .vmidx invalidated;
+                                                     rebuilt on next open;
+                                                     ESTALE returned on Page
+                                                     Cache miss during active
+                                                     mount (R/O only under lock)
+  archive.zip contains STORE + DEFLATE entries       both accessible
+  archive.zip contains unsupported compression       affected entries return
+                                                     UNSUPPORTED_COMPRESSION;
+                                                     other entries accessible
+  archive.zip contains VMM-native DEFLATE            in-place block commit
+                                                     available; no decoder_state
+                                                     in checkpoints
+  archive.zip contains Zstandard (method 93)         UNSUPPORTED_COMPRESSION
+                                                     until ZstdProvider is
+                                                     compiled in; seekable format
+                                                     used when VMM generates Zstd
+  archive.zip is ZIP64                               fully supported
+  commit() INCREMENTAL path                          Dead Space Freelist checked
+                                                     first; in-place reuse when
+                                                     hole fits; otherwise append;
+                                                     prior entry versions remain
+                                                     as dead data
+  commit() VMM-native in-place path                  dirty blocks overwritten
+                                                     at original byte offsets
+                                                     when recompressed size ≤
+                                                     capacity; no CD update
+  commit() FULL path                                 archive.zip atomically
+                                                     replaced via rename();
+                                                     no dead data in result
+  commit() BACKGROUND                                returns CommitHandle
+                                                     immediately; writes
+                                                     continue during BUILD;
+                                                     merge + rename on completion
+  compact() from CLEAN state                         FULL rewrite; eliminates
+                                                     all dead data
+  STORE-promoted entry                               subsequent commits are
+                                                     I/O only; no recompression
+  Two processes open same archive (R/W + any)        second open blocks until
+                                                     first mount closes
+  Two processes open same archive (R/O + R/O)        both proceed concurrently
+  R/W mount holds LOCK_EX for extended period        R/O openers queue; released
+                                                     at close(); see Concurrent
+                                                     Access specification
+  ESTALE detected during R/O read                    mount transitions to STALE;
+                                                     all subsequent I/O returns
+                                                     ESTALE; close and re-open
+  bloat_ratio ≥ gc_threshold                         FULL commit selected
+  bloat_bytes ≥ gc_max_bloat_bytes                   FULL commit selected
+  Hot entry (miss count > threshold)                 adaptive checkpointing
+                                                     may reduce interval for
+                                                     that entry in background
