@@ -220,6 +220,89 @@
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ENTRY OPERATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  In addition to page-granular read() and write(), the VMM supports
+  entry-level operations: creation, deletion, resizing, and renaming.
+  All of them act on the Diff Layer and the in-memory entry table only;
+  the source archive is modified exclusively by commit(), exactly as for
+  page writes.  Each operation is journaled as a METADATA RECORD in
+  .vmdirty (see vmdirty Journal Specification, Section 1) and is
+  recoverable under the same protocol as dirty pages.
+
+  Entry sizes:
+
+    Every entry has a logical_size, initialised from the Central
+    Directory at open() and updated in memory by the operations below.
+    read() beyond logical_size returns short (EOF semantics).
+    The vaddr regions of LAYER 1 are an internal abstraction; entries
+    are addressed by (path, page_index) throughout the Diff Layer and
+    the journal, so growing an entry never collides with a neighbour.
+
+  write(path, offset, data)  —  implicit extension
+
+    A write whose end exceeds logical_size extends the entry:
+
+        logical_size = offset + len(data)
+
+    Pages in the gap between the previous logical_size and offset that
+    are never written read as zeros, and are materialised as zero pages
+    at commit time.  ZIP has no sparse representation; runs of zeros
+    compress to negligible size under DEFLATE and Zstandard.
+
+    Implicit extension emits no METADATA RECORD.  The extended size is
+    reconstructible from the journal: the DATA RECORD for the final
+    page carries data_len = logical_size − page_start, so recovery
+    derives logical_size as the maximum page extent seen (see vmdirty
+    Journal Specification, Section 2).
+
+  create(path)
+
+    Creates an empty entry (logical_size = 0).  Fails with EEXIST if
+    the path exists and is not deleted in this session.  The entry
+    exists only in the Diff Layer until commit(); commit() emits a
+    Local File Header and a CD entry for it (INCREMENTAL: appended or
+    hole-placed; FULL: written in sequence).
+
+  truncate(path, new_size)
+
+    Shrink:  dirty pages beyond new_size are dropped from Tier 1; their
+    Tier 2 DATA RECORDs are superseded (they become dead records for
+    journal compaction purposes).  The final partial page is zero-
+    padded in its tail at commit.
+    Extend:  identical to implicit extension, recorded explicitly with
+    a RESIZE METADATA RECORD because no DATA RECORD carries the extent.
+
+  remove(path)
+
+    Marks the entry deleted (tombstone).  Subsequent read() and write()
+    return ENOENT; create(path) after remove(path) starts a fresh empty
+    entry.  At commit, the new Central Directory omits the entry.
+    INCREMENTAL: the entry's data region becomes dead space, reclaimed
+    via the Dead Space Freelist at next open().  FULL: not copied.
+
+  rename(old_path, new_path)
+
+    Remaps the entry in the entry table.  Fails with ENOENT if old_path
+    does not exist, EEXIST if new_path does.  At INCREMENTAL commit a
+    rename with no data change costs only a CD rewrite: the new CD
+    entry carries the new name and the unchanged data offset.  The
+    Local File Header retains the old name until the next FULL commit
+    rewrites it; ZIP readers treat the Central Directory as
+    authoritative, but tools that cross-check LFH names may warn until
+    then.
+
+  Ordering and recovery:
+
+    Entry operations share the sequence_num space of DATA RECORDs.
+    Recovery replays records strictly in sequence order, so a write
+    followed by remove() followed by create() reconstructs exactly the
+    session's final state.  The committed / uncommitted classification
+    by COMMIT MARKER applies to METADATA RECORDs identically.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   commit() FLOW
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1721,3 +1804,16 @@
   Hot entry (miss count > threshold)                 adaptive checkpointing
                                                      may reduce interval for
                                                      that entry in background
+  Entry created in session                           visible to this mount
+                                                     immediately; present in
+                                                     archive after commit()
+  Entry removed in session                           ENOENT to this mount;
+                                                     omitted from new CD at
+                                                     commit; data region
+                                                     becomes dead space
+  Entry renamed in session                           CD-only rewrite at
+                                                     INCREMENTAL commit; LFH
+                                                     name refreshed at next
+                                                     FULL commit
+  Entry extended past original size                  gap pages read as zeros;
+                                                     materialised at commit

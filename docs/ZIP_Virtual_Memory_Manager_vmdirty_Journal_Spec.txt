@@ -122,6 +122,44 @@
   │  Total: 40 bytes                                                         │
   └──────────────────────────────────────────────────────────────────────────┘
 
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  METADATA RECORD  ( variable length )                                    │
+  │                                                                          │
+  │  offset  size  field                  notes                              │
+  │  ──────  ────  ─────────────────────  ─────────────────────────────────  │
+  │   0      4     record_magic           0xD1A5EC1D                         │
+  │   4     16     generation_id          must equal header.generation_id    │
+  │  20      8     sequence_num           shared space with DATA RECORDs     │
+  │  28      2     op_code                1=CREATE 2=REMOVE 3=RESIZE 4=RENAME│
+  │  30      2     entry_name_len         byte length of entry_name (N)      │
+  │  32      N     entry_name             UTF-8 ZIP entry path, no NUL       │
+  │  32+N    P     op_payload             see OP PAYLOADS below              │
+  │  32+N+P  4     record_crc32           CRC-32C of bytes [0 .. 31+N+P]     │
+  │                                                                          │
+  │  Total: 36 + N + P  bytes                                                │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  OP PAYLOADS
+
+    CREATE  ( op_code = 1 )   payload: none ( P = 0 ).  logical_size = 0.
+    REMOVE  ( op_code = 2 )   payload: none ( P = 0 ).  Tombstone.
+    RESIZE  ( op_code = 3 )   payload: new_size : uint64  ( P = 8 ).
+                              Emitted by truncate().  A shrink supersedes
+                              journaled DATA RECORDs for pages beyond
+                              new_size ( they become dead records ).
+                              Implicit extension by write() emits no
+                              RESIZE; see logical_size derivation in
+                              Section 2.
+    RENAME  ( op_code = 4 )   payload: new_name_len : uint16
+                              + new_name : UTF-8, no NUL
+                              ( P = 2 + new_name_len ).
+
+  A METADATA RECORD participates in the same sequence_num ordering and
+  COMMIT MARKER classification as DATA RECORDs.  Recovery replays records
+  strictly in sequence order; an operation that follows a DATA RECORD for
+  the same entry supersedes it in ordinary program order ( e.g. REMOVE
+  invalidates earlier pages; CREATE after REMOVE begins a fresh entry ).
+
   CRC algorithm:
 
     CRC-32C (Castagnoli) is used for all CRC fields.
@@ -245,6 +283,55 @@
             ))
             pos = f.tell()
 
+        ── METADATA RECORD ──────────────────────────────────────────────────
+        elif magic == 0xD1A5EC1D:
+            fixed = f.read(28)          // gen(16) + seq(8) + op(2) + name_len(2)
+            if len(fixed) < 28:
+                truncation_point = pos
+                break
+
+            record_gen  = bytes(fixed[0:16])
+            seq_num     = uint64_le(fixed[16:24])
+            op_code     = uint16_le(fixed[24:26])
+            name_len    = uint16_le(fixed[26:28])
+
+            if record_gen != gen_id or op_code not in (1, 2, 3, 4):
+                truncation_point = pos
+                break
+
+            payload_len = { 1: 0, 2: 0, 3: 8 }.get(op_code)   // RENAME: read below
+            name_buf = f.read(name_len)
+            if len(name_buf) < name_len:
+                truncation_point = pos
+                break
+
+            if op_code == 4:            // RENAME: peek new_name_len
+                len_buf = f.read(2)
+                if len(len_buf) < 2:
+                    truncation_point = pos
+                    break
+                payload_len = 2 + uint16_le(len_buf)
+                payload = len_buf + f.read(payload_len - 2)
+            else:
+                payload = f.read(payload_len)
+            if len(payload) < payload_len:
+                truncation_point = pos
+                break
+
+            crc_buf = f.read(4)
+            covered = magic_buf + fixed + name_buf + payload
+            if len(crc_buf) < 4 or crc32c(covered) != uint32_le(crc_buf):
+                truncation_point = pos
+                break
+
+            valid_records.append(EntryOp(
+                op         = op_code,
+                entry_name = name_buf.decode('utf-8', errors='replace'),
+                payload    = payload,
+                sequence   = seq_num,
+            ))
+            pos = f.tell()
+
         ── COMMIT MARKER ────────────────────────────────────────────────────
         elif magic == 0xC0FFEE42:
             rest = f.read(36)           // gen(16) + commit_seq(8) + page_count(8) + crc(4)
@@ -270,19 +357,43 @@
             break
 
     ── STEP 3: Classify result ──────────────────────────────────────────────
-    committed_pages   = [r for r in valid_records if r.sequence <= last_commit_seq]
-    uncommitted_pages = [r for r in valid_records if r.sequence >  last_commit_seq]
+    pages = [r for r in valid_records if isinstance(r, DirtyPage)]
+    ops   = [r for r in valid_records if isinstance(r, EntryOp)]
+
+    committed_pages   = [r for r in pages if r.sequence <= last_commit_seq]
+    uncommitted_pages = [r for r in pages if r.sequence >  last_commit_seq]
+    committed_ops     = [r for r in ops   if r.sequence <= last_commit_seq]
+    uncommitted_ops   = [r for r in ops   if r.sequence >  last_commit_seq]
 
     return RecoveryResult(
         status             = OK,
         generation_id      = gen_id,
         committed_pages    = committed_pages,
         uncommitted_pages  = uncommitted_pages,
+        committed_ops      = committed_ops,
+        uncommitted_ops    = uncommitted_ops,
         last_commit_seq    = last_commit_seq,
         truncation_point   = truncation_point,
         valid_through_seq  = valid_records[-1].sequence if valid_records else 0,
     )
   ─────────────────────────────────────────────────────────────────────────────
+
+  logical_size derivation during replay:
+
+    Replaying the selected records (pages and ops interleaved in strict
+    sequence order) reconstructs each entry's logical_size:
+
+      base          = uncompressed_size from the Central Directory
+                      ( 0 after CREATE; undefined after REMOVE )
+      RESIZE        sets logical_size = new_size
+      DATA RECORD   sets logical_size = max( logical_size,
+                                page_index × page_size + data_len )
+
+    The max() rule recovers implicit extension by write() without a
+    dedicated record: the DATA RECORD for an entry's final page carries
+    data_len = logical_size − page_start.  Pages inside an extension gap
+    that were never written are absent from the journal and read as
+    zeros.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -300,6 +411,8 @@
   │  generation_id      identifies the mount session that wrote this file    │
   │  committed_pages    pages whose sequence ≤ last commit marker            │
   │  uncommitted_pages  pages whose sequence > last commit marker            │
+  │  committed_ops      entry operations whose sequence ≤ last commit marker │
+  │  uncommitted_ops    entry operations whose sequence > last commit marker │
   │  last_commit_seq    0 if no commit marker was ever written               │
   │  truncation_point   byte offset of detected truncation; None if clean   │
   │  valid_through_seq  highest sequence number that passed CRC validation   │
@@ -309,12 +422,14 @@
   │  Caller resolution options                                               │
   │                                                                          │
   │  recover_committed()                                                     │
-  │    Restore only committed_pages into Tier 1.                             │
-  │    Discard uncommitted_pages.                                            │
+  │    Replay committed_ops into the entry table and restore                 │
+  │    committed_pages into Tier 1, interleaved in sequence order.           │
+  │    Discard uncommitted_pages and uncommitted_ops.                        │
   │    Safe for any automated recovery.                                      │
   │                                                                          │
   │  recover_all()                                                           │
-  │    Restore committed_pages + uncommitted_pages into Tier 1.              │
+  │    Replay all ops and restore all pages, committed and uncommitted,      │
+  │    interleaved in sequence order.                                        │
   │    Caller accepts that uncommitted pages may represent partial state.    │
   │    Suitable for single-writer applications with no logical transaction   │
   │    boundary.                                                             │
@@ -376,6 +491,11 @@
                                                | recover_all()
                                                | discard()
                                                | abort()
+
+  Wherever the tree tests committed_pages / uncommitted_pages, the
+  corresponding ops lists are included in the same test: a journal
+  containing only METADATA RECORDs ( e.g. a session that only renamed
+  or removed entries ) is still a recoverable dirty session.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -588,6 +708,11 @@
     appendRecord(entry_name, page_index, data) → sequence_num
         Builds DATA RECORD, computes CRC-32C, writes atomically.
 
+    appendMetadata(op_code, entry_name, payload) → sequence_num
+        Builds METADATA RECORD (CREATE / REMOVE / RESIZE / RENAME),
+        computes CRC-32C, writes atomically.  Shares the sequence_num
+        counter with appendRecord().
+
     appendCommitMarker(commit_sequence)
         Writes COMMIT MARKER, calls fdatasync().
 
@@ -702,7 +827,8 @@
          sequence.  Commit markers are never written out of order.
 
   I-5  sequence_num is strictly monotonically increasing per generation.
-         No two DATA RECORDs in the same .vmdirty file share a sequence_num.
+         No two records (DATA or METADATA) in the same .vmdirty file share
+         a sequence_num.
 
   I-6  The in-memory VmdirtyIndex is always consistent with .vmdirty on disk.
          If a record was appended to disk, it is present in the index or
@@ -759,7 +885,11 @@
                     (entry_name, page_index) pair; the record currently
                     indexed by VmdirtyIndex.
     dead record  :  any DATA RECORD superseded by a later record for the
-                    same (entry_name, page_index) pair.
+                    same (entry_name, page_index) pair, or invalidated by
+                    a later METADATA RECORD ( REMOVE of the entry; RESIZE
+                    shrink past the page ).  A METADATA RECORD is dead
+                    when a later operation on the same entry supersedes
+                    its effect ( e.g. CREATE followed by REMOVE ).
 
 
   Compaction trigger:
@@ -780,10 +910,16 @@
          a.  FILE HEADER with a new generation_id drawn from a
              cryptographically secure random source.
 
-         b.  One DATA RECORD per entry in VmdirtyIndex, using the live page
+         b.  One METADATA RECORD per entry whose lifecycle state differs
+             from the source archive ( created / removed / resized /
+             renamed ), reflecting the FINAL state only — intermediate
+             operation history is not preserved.  Emitted before that
+             entry's DATA RECORDs so that replay order is valid.
+
+         b2. One DATA RECORD per entry in VmdirtyIndex, using the live page
              data.  Sequence numbers are assigned 1, 2, 3, … in arbitrary
-             order (the new generation_id makes sequence numbering independent
-             of the prior session).
+             entry order (the new generation_id makes sequence numbering
+             independent of the prior session).
 
          c.  A COMMIT MARKER with commit_sequence = highest assigned
              sequence number, if and only if all live records were
