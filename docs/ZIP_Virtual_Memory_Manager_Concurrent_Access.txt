@@ -451,18 +451,26 @@
   number of archives opened.
 
     Prepare handler  ( runs in parent before fork() ):
-        For each active VmmMount with a dirty Diff Layer:
-            call flush()  ( STRICT )
-        This ensures .vmdirty is fully durable before the process image
-        is duplicated.  If flush() fails (e.g. disk full), fork() is
-        allowed to proceed; the child inherits a consistent, if incomplete,
-        dirty state.
+        Acquires every active mount's internal mutexes ( write mutex,
+        spill queue mutex ) in a fixed global order.  This guarantees
+        that the child's copy of the address space is not snapshotted
+        in the middle of a Tier 1 or journal-index mutation.
+
+        The prepare handler performs no I/O.  An earlier revision of
+        this specification called flush() here; that work was removed
+        because the child invalidates all inherited mounts regardless
+        ( see child handler ), so pre-fork durability bought nothing,
+        while performing disk I/O under locks inside an atfork handler
+        created a deadlock risk against other libraries' atfork
+        handlers.  Durability remains governed by the ordinary spill
+        and flush() semantics in the parent.
 
     Parent handler  ( runs in parent after fork() returns ):
-        No action required.  The parent's mounts continue normally.
+        Releases the mutexes acquired by the prepare handler, in
+        reverse order.  The parent's mounts continue normally.
 
     Child handler  ( runs in child after fork() returns ):
-        For each active VmmMount:
+        Releases the inherited mutexes, then for each active VmmMount:
             call provider.invalidate_after_fork()
             This calls close(vmlock_fd) on the inherited fd without
             issuing any unlock primitive.  For FlockLockProvider, this
@@ -498,9 +506,11 @@
   7.5  Interaction with pthread_atfork and third-party libraries
 
   The VMM's pthread_atfork() handler may run in any order relative to
-  handlers registered by other libraries.  The flush() in the prepare
-  handler is idempotent; running it multiple times is safe.  The child
-  handler's invalidation is also idempotent.
+  handlers registered by other libraries.  Because the prepare handler
+  only acquires VMM-internal mutexes — no I/O, no callbacks — it cannot
+  participate in a cross-library lock cycle unless another library's
+  handler acquires VMM locks, which no supported configuration does.
+  The child handler's invalidation is idempotent.
 
   Applications that use exec() after fork() (the fork-exec idiom) incur
   no special VMM concern: exec() closes all file descriptors not marked
