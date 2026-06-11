@@ -49,7 +49,9 @@
   │  12     16     generation_id          see GENERATION ID below            │
   │  28      8     source_file_size       stat().st_size of archive.zip      │
   │  36      8     source_inode           stat().st_ino of archive.zip       │
-  │  44     20     source_cd_hash         SHA-1 of Central Directory block   │
+  │  44     20     source_cd_hash         XXH3-128 of Central Directory      │
+  │                                       block (16 bytes) + 4 bytes zero    │
+  │                                       padding                            │
   │  64      8     created_at_ns          wall-clock ns; informational only  │
   │  72      4     page_size              bytes per page (e.g. 4096)         │
   │  76      4     reserved               0x00000000                         │

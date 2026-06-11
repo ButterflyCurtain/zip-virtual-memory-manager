@@ -150,8 +150,8 @@
        │
        └─ Seek Index + Source ZIP:
                [ESTALE check]  stat() archive.zip; compare st_size + st_ino
-               to stored fingerprint.  Mismatch → ESTALE  ( see SNAPSHOT
-               CONSISTENCY section )
+               + st_mtime_ns to stored fingerprint.  Mismatch → ESTALE
+               ( see SNAPSHOT CONSISTENCY section )
                locate nearest checkpoint ≤ target page
                decompress forward to target page  ( DEFLATE entries )
                direct seek to data offset         ( STORE entries )
@@ -355,7 +355,11 @@
        │           Crash before rename : source ZIP survives intact
        │           Crash after  rename : new ZIP is complete and valid
        │
-       ├─ Update archive.zip.vmidx for modified entries only
+       ├─ Update archive.zip.vmidx for modified entries only, and refresh
+       │  the .vmidx header fingerprint ( file_size, inode, mtime_ns,
+       │  cd_hash ).  The FULL path replaces the archive inode via
+       │  rename(); without the refresh, the next open() would
+       │  invalidate the entire index.
        │
        └─ Delete archive.zip.vmdirty
 
@@ -698,7 +702,8 @@
          rename(archive.new.zip → archive.zip)   ← POSIX atomic.
          All dirty state through D is now contained in archive.zip.
          Clear Diff Layer (Tier 1 + Tier 2); delete .vmdirty.
-         Update .vmidx for all modified entries.
+         Update .vmidx for all modified entries and refresh the .vmidx
+         header fingerprint ( the rename replaced the archive inode ).
          Mount transitions to CLEAN.
 
   The MERGE step's pause duration is proportional to D's size.  Background
@@ -1450,13 +1455,23 @@
   Check procedure on Page Cache miss:
 
     1. stat() archive.zip.
-    2. Compare st_size and st_ino to the fingerprint recorded at open().
-    3. If both match: proceed with seek and decompression.
-    4. If either differs:
+    2. Compare st_size, st_ino, and st_mtime_ns to the fingerprint
+       recorded at open().
+    3. If all match: proceed with seek and decompression.
+    4. If any differs:
          Transition mount to STALE state.
          Return ESTALE to the caller.
          All subsequent read() and write() calls return ESTALE until
          the mount is closed and re-opened.
+
+  st_mtime_ns participates as a change TRIGGER, not as a validity gate.
+  A same-size in-place modification changes neither st_size nor st_ino;
+  on local filesystems it does update mtime, so including mtime closes
+  that blind spot.  On filesystems where mtime is unreliable (NFS
+  attribute caching, FAT granularity), a spurious mtime change can only
+  produce a false positive, which --strict-estale resolves by verifying
+  cd_hash before entering STALE state; a false negative on mtime leaves
+  detection no worse than the size+inode check alone.
 
   The check is O(1): a single stat() syscall, no I/O into the archive.
   The cost is one syscall per Page Cache miss.  For workloads with a

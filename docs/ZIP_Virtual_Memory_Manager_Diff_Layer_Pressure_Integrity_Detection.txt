@@ -181,10 +181,11 @@
   │   ───────────────────────────────────────────────────────────────────── │
   │   file_size            stat().st_size            O(1)                   │
   │   inode                stat().st_ino             O(1)                   │
-  │   cd_hash              SHA-1 of Central          O(cd_size) ← fast      │
+  │   cd_hash              XXH3-128 of Central       O(cd_size) ← fast      │
   │                        Directory block only                              │
-  │   mtime_ns             stat().st_mtime_ns        O(1), diagnostics only  │
-  │   full_hash            SHA-1 of entire file      O(file_size) ← slow    │
+  │   mtime_ns             stat().st_mtime_ns        O(1), runtime ESTALE    │
+  │                                                  trigger + diagnostics   │
+  │   full_hash            XXH3-128 of entire file   O(file_size) ← slow    │
   │                        ( computed only in strict-fingerprint mode )      │
   └──────────────────────────────────────────────────────────────────────────┘
 
@@ -202,10 +203,24 @@
        │       Match   → index valid, mount immediately  ✓
        │       Mismatch→ ──────────────────────────────────────→ INVALIDATE
        │
-       └─[3]  mtime_ns is recorded in the .vmidx header for diagnostics
-              and audit trail purposes only.  It is not used as a validity
-              gate because it is unreliable on NFS, FAT, and some
-              distributed filesystems.
+       └─[3]  mtime_ns is recorded in the .vmidx header.  It is not used
+              as a validity gate at open() — it is unreliable on NFS, FAT,
+              and some distributed filesystems, and cd_hash is checked at
+              open() regardless — but it participates as a change TRIGGER
+              in the runtime ESTALE check, where it catches same-size
+              in-place modification that size+inode cannot (see main
+              architecture document, SNAPSHOT CONSISTENCY).
+
+  Hash algorithm note:
+
+    cd_hash and full_hash are integrity checks against accidental
+    corruption and out-of-band modification.  They are not message
+    authentication codes and prove nothing about origin; authenticity
+    is out of scope (see UNTRUSTED ARCHIVES in the main architecture
+    document).  XXH3-128 is chosen for throughput (an order of
+    magnitude faster than cryptographic hashes, relevant for
+    --strict-fingerprint on multi-GB archives) with a 128-bit state
+    space that makes accidental collision negligible.
 
   INVALIDATE path:
        │
@@ -224,7 +239,7 @@
   ┌─────────────────────────────────────────────────────────────────────────┐
   │  --strict-fingerprint                                                    │
   │                                                                          │
-  │  Adds a full SHA-1 of archive.zip at every open(), regardless of        │
+  │  Adds a full XXH3-128 of archive.zip at every open(), regardless of     │
   │  steps [1] and [2].  Correct even when mtime is stale or inode is       │
   │  recycled.                                                               │
   │                                                                          │
