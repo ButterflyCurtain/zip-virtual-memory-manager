@@ -558,9 +558,9 @@
 
   The VMM's concurrency model is designed for discrete, session-oriented
   access patterns where a single writer performs a bounded unit of work
-  and commits.  The coarse-grained lock is a deliberate match for this
-  model; it is not a limitation to be worked around but a constraint that
-  defines the scope of correct use.
+  and commits.  The coarse-grained lock matches this model.  Workloads
+  inside and outside that boundary are listed below so the scope of
+  correct use is explicit rather than implied.
 
   Workloads within scope:
 
