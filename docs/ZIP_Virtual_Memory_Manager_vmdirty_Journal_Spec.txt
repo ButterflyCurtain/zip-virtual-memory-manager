@@ -1,12 +1,12 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                                                                              ║
 ║                        ZIP Virtual Memory Manager                            ║
-║                      .vmdirty Journal Specification                          ║
+║                      vmdirty Journal Specification                          ║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 
-  The .vmdirty file is an append-only binary journal that durably stores dirty
+  The vmdirty file is an append-only binary journal that durably stores dirty
   pages spilled from the Diff Layer Tier 1 (in-memory) to Tier 2 (on-disk).
   It survives process crashes and provides the VMM with a complete, verifiable
   recovery basis.
@@ -195,7 +195,7 @@
   SECTION 2 : Recovery Read Algorithm
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Executed once at open() when a .vmdirty file is found.
+  Executed once at open() when a vmdirty file is found.
 
   ─────────────────────────────────────────────────────────────────────────────
   function read_vmdirty(path) -> RecoveryResult:
@@ -437,12 +437,12 @@
   │    boundary.                                                             │
   │                                                                          │
   │  discard()                                                               │
-  │    Delete .vmdirty.  All dirty pages are lost.                           │
+  │    Delete vmdirty.  All dirty pages are lost.                           │
   │    Mount proceeds clean.                                                 │
   │    Suitable for read-only use cases or when caller can regenerate.       │
   │                                                                          │
   │  abort()                                                                 │
-  │    Leave .vmdirty on disk untouched.  Do not mount.                     │
+  │    Leave vmdirty on disk untouched.  Do not mount.                     │
   │    Suitable for manual inspection before a decision is made.             │
   └──────────────────────────────────────────────────────────────────────────┘
 
@@ -450,9 +450,9 @@
 
   open( archive.zip )
        │
-       ├─ .vmdirty absent → mount CLEAN
+       ├─ vmdirty absent → mount CLEAN
        │
-       └─ .vmdirty present
+       └─ vmdirty present
                │
                ├─ fingerprint check: source ZIP changed while dirty pages exist?
                │       YES → CONFLICT state
@@ -519,7 +519,7 @@
          i.   Build DATA RECORD in a write buffer.
          ii.  Compute CRC-32C over the buffer (excluding the crc field).
          iii. Append CRC to buffer.
-         iv.  Write buffer to .vmdirty with a single write() call.
+         iv.  Write buffer to vmdirty with a single write() call.
               ( Single call minimizes the torn-write window. )
     c. Remove victim page from Tier 1.  Decrease dirty_current.
     d. Update the in-memory Tier 2 index:
@@ -528,7 +528,7 @@
   fsync policy:
 
     Default (--sync-spill):
-        .vmdirty is opened with O_DSYNC.
+        vmdirty is opened with O_DSYNC.
         Each write is durable before returning.
 
     Fast mode (--lazy-spill):
@@ -543,7 +543,7 @@
       dirty_current is unchanged.
 
   Write hit on a page already in Tier 2:
-      Append a new DATA RECORD to .vmdirty (higher sequence_num).
+      Append a new DATA RECORD to vmdirty (higher sequence_num).
       The new record supersedes the prior one for recovery purposes.
       The page is not moved back to Tier 1.
 
@@ -557,7 +557,7 @@
     a. Spill all Tier 1 pages that exceed dirty_limit.
     b. Spill all remaining Tier 1 pages.
     c. Build COMMIT MARKER with commit_sequence = highest sequence_num.
-    d. Write to .vmdirty.
+    d. Write to vmdirty.
     e. fdatasync().
     f. Update in-memory last_commit_seq.
 
@@ -601,7 +601,7 @@
 
       while dirty_current + incoming > dirty_limit:
           victim = insertion_order.pop_front()    // oldest
-          write DATA RECORD to .vmdirty
+          write DATA RECORD to vmdirty
           remove from index
           dirty_current -= page_size
 
@@ -613,7 +613,7 @@
 
   Write hit on a Tier 2 page:
 
-      Append new DATA RECORD (higher sequence_num) to .vmdirty.
+      Append new DATA RECORD (higher sequence_num) to vmdirty.
       New record supersedes old one for recovery.
       Page remains in Tier 2; it is not moved back to Tier 1.
 
@@ -622,7 +622,7 @@
     1. Write page A  → A is the oldest dirty page
     2. Write 63 other pages → fills Tier 1 near dirty_limit
     3. Write one more page  → pressure → FIFO spills A to Tier 2
-    4. Write page A again   → appends another DATA RECORD to .vmdirty
+    4. Write page A again   → appends another DATA RECORD to vmdirty
 
     A temperature-aware policy would detect A as hot and spare it from
     spill.  This is a correctness-neutral trade-off; the FIFO policy
@@ -632,7 +632,7 @@
 
   5.2  Temperature-Aware Spill Policies (optional, mount-time selection)
 
-  The .vmdirty format is policy-agnostic.  Only the victim selection
+  The vmdirty format is policy-agnostic.  Only the victim selection
   algorithm in Tier 1 changes.  No format migration is required.
 
   LRU policy:
@@ -661,7 +661,7 @@
   SECTION 6 : Generation ID and Session Provenance
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  A .vmdirty file left on disk by a prior mount session must be
+  A vmdirty file left on disk by a prior mount session must be
   distinguishable from one written by the current session.  This matters
   especially on network-mounted filesystems where multiple hosts may share
   the same archive path.
@@ -669,28 +669,28 @@
   Provenance check on open():
 
     The VMM does NOT compare generation IDs for equality between sessions.
-    A .vmdirty from a prior session always has a different generation ID;
+    A vmdirty from a prior session always has a different generation ID;
     this is expected.  The relevant check is source fingerprint:
 
-        .vmdirty.header.source_file_size == stat(archive.zip).st_size
+        vmdirty.header.source_file_size == stat(archive.zip).st_size
         AND
-        .vmdirty.header.source_inode     == stat(archive.zip).st_ino
+        vmdirty.header.source_inode     == stat(archive.zip).st_ino
         AND
-        .vmdirty.header.source_cd_hash   == current cd_hash
+        vmdirty.header.source_cd_hash   == current cd_hash
 
-    Fingerprint matches → .vmdirty is from a prior mount of THIS archive.
+    Fingerprint matches → vmdirty is from a prior mount of THIS archive.
         The generation_id identifies which prior session.  Proceed with
         the recovery protocol.
 
-    Fingerprint mismatches → .vmdirty is stale (source changed).
+    Fingerprint mismatches → vmdirty is stale (source changed).
         CONFLICT state.  Caller must resolve.
 
   Recovery and session transition:
 
     On a fresh mount after recovery:
-        old .vmdirty → rename to .vmdirty.bak.{generation_id hex}
-        new .vmdirty → created with a new generation_id
-        .vmdirty.bak.* → retained for forensics; not used by the VMM
+        old vmdirty → rename to vmdirty.bak.{generation_id hex}
+        new vmdirty → created with a new generation_id
+        vmdirty.bak.* → retained for forensics; not used by the VMM
 
     Each DATA RECORD carries the generation_id from the file header.
     A generation_id mismatch within a record terminates record walking
@@ -748,21 +748,21 @@
 
   VmdirtyIndex  ( in-memory only )
 
-    Populated at mount from an existing .vmdirty when present.
+    Populated at mount from an existing vmdirty when present.
     Maps (entry_name, page_index) → byte_offset_in_vmdirty.
     Used by the Tier 2 read path.
-    Rebuilt entirely from .vmdirty on recovery; never persisted separately.
+    Rebuilt entirely from vmdirty on recovery; never persisted separately.
 
 
   VmmMount
 
     open(path, options)
-        Acquires advisory lock on archive.zip.vmlock.
+        Acquires advisory lock on archive.zip.vmm/vmlock.
         Runs fingerprint validation.
-        Runs VmdirtyReader if .vmdirty is present.
+        Runs VmdirtyReader if vmdirty is present.
         Routes to recovery decision tree.
         Exposes RecoveryResult to caller.
-        Removes orphan archive.zip.vmdirty.compact and archive.new.zip
+        Removes orphan archive.zip.vmm/vmdirty.compact and archive.new.zip
         if present with no active mount.
 
     RecoveryHandler interface
@@ -771,8 +771,8 @@
 
     applyRecovery(decision, result)
         Loads committed_pages (and optionally uncommitted_pages) into Tier 1.
-        Renames old .vmdirty to .vmdirty.bak.{generation_id hex}.
-        Creates new .vmdirty for the current session.
+        Renames old vmdirty to vmdirty.bak.{generation_id hex}.
+        Creates new vmdirty for the current session.
 
     flush()
         STRICT: spill all Tier 1 pages → appendCommitMarker() → fdatasync()
@@ -783,15 +783,15 @@
         Selects INCREMENTAL or FULL path based on bloat_ratio and gc_threshold.
         INCREMENTAL: appends modified entry data + new CD + EOCD to archive.zip.
         FULL: recompress → write archive.new.zip → rename().
-        On success: deletes .vmdirty; updates .vmidx for modified entries.
-        On failure before archive modification: .vmdirty remains intact;
+        On success: deletes vmdirty; updates vmidx for modified entries.
+        On failure before archive modification: vmdirty remains intact;
         recovery path is intact.
 
     compact()
         Permitted only from CLEAN state (no dirty pages).
         Performs FULL (compaction) commit with an empty Diff Layer.
         Eliminates accumulated dead data in archive.zip.
-        Does not touch .vmdirty (none is present in CLEAN state).
+        Does not touch vmdirty (none is present in CLEAN state).
 
     compactJournal()
         Triggered internally when dead_record_count > live_record_count.
@@ -817,29 +817,29 @@
            (c) recover_committed() / recover_all() — recovery decision
          It is never removed by LRU eviction, OOM killer, or any implicit path.
 
-  I-3  .vmdirty grows monotonically within a session, except during compaction.
+  I-3  vmdirty grows monotonically within a session, except during compaction.
          Records are only appended, never overwritten in place.
          Exception 1: the header flags field may be updated in place for the
          RECOVERY_PENDING bit (single aligned write; safe on all platforms).
-         Exception 2: compaction (Section 10) replaces .vmdirty atomically
-         via rename() of archive.zip.vmdirty.compact, producing a smaller
+         Exception 2: compaction (Section 10) replaces vmdirty atomically
+         via rename() of archive.zip.vmm/vmdirty.compact, producing a smaller
          file with no dead records.  After rename(), monotonic growth resumes.
 
   I-4  A COMMIT MARKER sequence number is always ≥ the previous commit
          sequence.  Commit markers are never written out of order.
 
   I-5  sequence_num is strictly monotonically increasing per generation.
-         No two records (DATA or METADATA) in the same .vmdirty file share
+         No two records (DATA or METADATA) in the same vmdirty file share
          a sequence_num.
 
-  I-6  The in-memory VmdirtyIndex is always consistent with .vmdirty on disk.
+  I-6  The in-memory VmdirtyIndex is always consistent with vmdirty on disk.
          If a record was appended to disk, it is present in the index or
          superseded by a newer record for the same page.
 
   I-7  After flush() returns (STRICT mode), all dirty pages are durable.
          A crash after flush() is fully recoverable via recover_committed().
 
-  I-8  At most one process holds LOCK_EX on archive.zip.vmlock at any time.
+  I-8  At most one process holds LOCK_EX on archive.zip.vmm/vmlock at any time.
          This is enforced by the kernel; no additional in-process coordination
          is required beyond acquiring the lock at open() and releasing at
          close().
@@ -849,24 +849,27 @@
   SECTION 9 : Sidecar File Naming and Co-location Rules
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  archive.zip                       source ZIP (read-only until commit)
-  archive.zip.vmidx                 seek index (rebuilt if absent or stale)
-  archive.zip.vmlock                advisory lock coordination file
-  archive.zip.vmdirty               spill journal (current session)
-  archive.zip.vmdirty.bak.{gen_id}  recovered journal (forensics retention)
+  archive.zip                source ZIP (read-only until commit)
+  archive.zip.vmm/           sidecar directory (created at first open)
+    vmidx                    seek index (rebuilt if absent or stale)
+    vmlock                   advisory lock coordination file
+    vmdirty                  spill journal (current session)
+    vmdirty.bak.{gen_id}     recovered journal (forensics retention)
 
-  If archive.zip is moved, all sidecar files must move with it.
+  If archive.zip is moved, the sidecar directory must move with it.
+  Never delete the sidecar directory while a mount is active (see main
+  architecture document, SIDECAR FILES, deletion warning).
 
-  A ZIP without its .vmidx is still a valid ZIP; first-open rebuilds the index.
-  A ZIP without its .vmlock is handled by creating the file at next open().
+  A ZIP without its vmidx is still a valid ZIP; first-open rebuilds the index.
+  A ZIP without its vmlock is handled by creating the file at next open().
 
-  A ZIP without its .vmdirty means dirty pages from a prior session are lost.
+  A ZIP without its vmdirty means dirty pages from a prior session are lost.
   The source ZIP itself is unaffected.
 
   On commit() success:
-    .vmdirty is deleted.
-    .vmidx is updated for modified entries only.
-    .vmdirty.bak.* files are retained for a configurable period
+    vmdirty is deleted.
+    vmidx is updated for modified entries only.
+    vmdirty.bak.* files are retained for a configurable period
     (default: 24 hours, or deleted at next clean mount).
 
 
@@ -874,11 +877,11 @@
   SECTION 10 : Journal Compaction
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  The .vmdirty file grows monotonically within a session.  When the same
+  The vmdirty file grows monotonically within a session.  When the same
   page is written multiple times and spills to Tier 2 on each occasion,
   a new DATA RECORD is appended for each spill while the prior records for
   the same (entry_name, page_index) remain on disk as unreferenced data.
-  Compaction eliminates these dead records, bounding .vmdirty size to
+  Compaction eliminates these dead records, bounding vmdirty size to
   one DATA RECORD per unique live dirty page.
 
   Terminology:
@@ -929,11 +932,11 @@
              ( i.e. original_sequence ≤ last_commit_seq for every live page ).
              If any live record was uncommitted, no COMMIT MARKER is written.
 
-    2. Write the buffer to  archive.zip.vmdirty.compact.
+    2. Write the buffer to  archive.zip.vmm/vmdirty.compact.
 
-    3. fdatasync()  on  archive.zip.vmdirty.compact.
+    3. fdatasync()  on  archive.zip.vmm/vmdirty.compact.
 
-    4. rename( archive.zip.vmdirty.compact → archive.zip.vmdirty ).
+    4. rename( archive.zip.vmm/vmdirty.compact → archive.zip.vmm/vmdirty ).
 
     5. Rebuild VmdirtyIndex by reading the compacted file from the start
        ( offsets have changed ).
@@ -946,11 +949,11 @@
 
   Crash safety:
 
-    Crash before step 4 :  archive.zip.vmdirty is unchanged.
-                           archive.zip.vmdirty.compact is an orphan;
+    Crash before step 4 :  archive.zip.vmm/vmdirty is unchanged.
+                           archive.zip.vmm/vmdirty.compact is an orphan;
                            it is removed silently at next open().
     Crash after step 4  :  the compacted file is the recovery basis.
-                           Its format is identical to an ordinary .vmdirty
+                           Its format is identical to an ordinary vmdirty
                            and is processed by the standard recovery protocol
                            in Section 3.  No special recovery case is required.
 

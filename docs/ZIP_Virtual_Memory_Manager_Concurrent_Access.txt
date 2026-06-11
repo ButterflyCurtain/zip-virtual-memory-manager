@@ -7,8 +7,8 @@
 
 
   The VMM coordinates access between processes that open the same archive
-  using an advisory lock on a dedicated sidecar file: archive.zip.vmlock.
-  This prevents concurrent dirty sessions from corrupting .vmdirty and
+  using an advisory lock on a dedicated sidecar file: archive.zip.vmm/vmlock.
+  This prevents concurrent dirty sessions from corrupting vmdirty and
   serializes commit() against active read mounts.
 
   Lock acquisition is delegated to a LockProvider, which encapsulates the
@@ -20,27 +20,27 @@
   SECTION 1 : Lock File
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Lock file path:  archive.zip.vmlock
+  Lock file path:  archive.zip.vmm/vmlock
 
-  The .vmlock file is created at first open() if absent.  Its presence on
-  disk carries no semantics: a .vmlock file with no active kernel lock
+  The vmlock file is created at first open() if absent.  Its presence on
+  disk carries no semantics: a vmlock file with no active kernel lock
   indicates no live mount, not a crash or an error.  Lock state is
   maintained entirely by the kernel and is released automatically on
   process exit.
 
-  The lock is placed on .vmlock rather than on archive.zip for two reasons:
+  The lock is placed on vmlock rather than on archive.zip for two reasons:
 
     (a) archive.zip may be opened simultaneously by third-party tools
         (unzip, 7-Zip, etc.) that have no awareness of VMM locking.
-        Locking .vmlock leaves those tools unaffected.
+        Locking vmlock leaves those tools unaffected.
 
     (b) commit() renames archive.new.zip over archive.zip, replacing the
         inode.  A lock held on archive.zip before the rename would be held
         on the old inode; a new opener would acquire the lock on the new
-        inode without conflict.  Locking .vmlock avoids this inode
-        replacement problem: .vmlock is never renamed.
+        inode without conflict.  Locking vmlock avoids this inode
+        replacement problem: vmlock is never renamed.
 
-  The .vmlock file is not deleted on close().  It is safe to delete it
+  The vmlock file is not deleted on close().  It is safe to delete it
   manually when no VMM process is running.
 
 
@@ -56,7 +56,7 @@
   │   Lock acquired:  LOCK_EX  ( exclusive )                                │
   │                                                                          │
   │   Blocks until:   all other processes release both LOCK_EX and          │
-  │                   LOCK_SH on .vmlock.                                   │
+  │                   LOCK_SH on vmlock.                                   │
   │                                                                          │
   │   Invariant:      at most one read-write mount is active at any time.   │
   │                   At most one process holds LOCK_EX at any time         │
@@ -97,7 +97,7 @@
 
     A read-write mount holds LOCK_EX from open() to close().  This is a
     deliberate design: the lock covers the entire session, not just the
-    commit() step, because the .vmdirty journal is written throughout the
+    commit() step, because the vmdirty journal is written throughout the
     session and must not be observable by a concurrent writer.
 
     A direct consequence is that any process that calls open() in read-only
@@ -122,7 +122,7 @@
       Background commit  ( background_compact=true or mode=BACKGROUND )
           The LOCK_EX is held throughout the BUILD, MERGE, and RENAME
           phases.  Background commit reduces the time during which the
-          .vmdirty journal represents the only copy of dirty data, and
+          vmdirty journal represents the only copy of dirty data, and
           it reduces the duration of the MERGE pause, but it does not
           shorten the lock-hold period from the R/O opener's perspective.
           The archive remains exclusively held for the R/W session's
@@ -156,7 +156,7 @@
 
       LOCK_EX prevents concurrent VMM mounts from accessing the archive.
       It does not prevent external tools (unzip, cp, rsync, etc.) that
-      do not use the .vmlock protocol from reading archive.zip during the
+      do not use the vmlock protocol from reading archive.zip during the
       R/W session.  Such external reads see a consistent ZIP (the source
       ZIP is not modified until commit() completes), but they may observe
       intermediate states of archive.new.zip if they scan the directory.
@@ -173,7 +173,7 @@
 
   open( archive.zip, mode )
        │
-       ├─ open or create archive.zip.vmlock  ( O_CREAT | O_RDWR )
+       ├─ open or create archive.zip.vmm/vmlock  ( O_CREAT | O_RDWR )
        │
        ├─ mode == READ_WRITE:
        │       provider.acquire_exclusive()   ← blocking by default
@@ -204,7 +204,7 @@
 
   There is no stale-lock condition.  If a process holding LOCK_EX dies
   without calling close(), the kernel releases the lock and the next
-  open() acquires it normally.  A .vmdirty left behind by the dead
+  open() acquires it normally.  A vmdirty left behind by the dead
   process is handled by the recovery protocol at that open().
 
 
@@ -216,11 +216,11 @@
   upgrade is needed.  The sequence is:
 
     (lock is already held as LOCK_EX)
-    flush()          → all dirty pages durable in .vmdirty
+    flush()          → all dirty pages durable in vmdirty
     recompress       → write archive.new.zip
     rename()         → archive.new.zip → archive.zip  (POSIX atomic)
-    update .vmidx
-    delete .vmdirty
+    update vmidx
+    delete vmdirty
     (LOCK_EX continues until close())
 
   Because LOCK_EX blocks any LOCK_SH holder from acquiring in the
@@ -236,7 +236,7 @@
   The rename() that replaces archive.zip is POSIX atomic on local
   filesystems.  Processes with archive.zip already open will continue
   to read from the old inode via their file descriptors; new opens will
-  see the new inode.  The .vmlock file is unaffected by the rename.
+  see the new inode.  The vmlock file is unaffected by the rename.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -384,12 +384,12 @@
 
   When a read-write mount crashes:
 
-    1. The kernel releases LOCK_EX on .vmlock automatically
+    1. The kernel releases LOCK_EX on vmlock automatically
        (FlockLockProvider / FcntlLockProvider).
        ExternalLockProvider leases expire per the external service's policy.
-    2. .vmdirty remains on disk with whatever records were written before
+    2. vmdirty remains on disk with whatever records were written before
        the crash.
-    3. The next open() acquires LOCK_EX, finds .vmdirty, and runs the
+    3. The next open() acquires LOCK_EX, finds vmdirty, and runs the
        recovery protocol (see vmdirty Journal Specification, Section 3).
     4. The caller resolves the RecoveryResult before the mount proceeds.
 
@@ -401,7 +401,7 @@
   When a read-only mount crashes:
 
     1. The kernel releases LOCK_SH automatically.
-    2. No .vmdirty is written by a read-only mount.
+    2. No vmdirty is written by a read-only mount.
     3. No recovery is needed.
 
   Sequence when a new open() races with a just-crashed writer:
@@ -410,10 +410,10 @@
   │  Writer process               New open()                             │
   │  ──────────────               ─────────                              │
   │  [crash — kernel releases                                            │
-  │   LOCK_EX on .vmlock]                                                │
+  │   LOCK_EX on vmlock]                                                │
   │                               acquire_exclusive() → succeeds         │
   │                               fingerprint validation                 │
-  │                               .vmdirty found → recovery protocol    │
+  │                               vmdirty found → recovery protocol    │
   │                               RecoveryResult → caller decision       │
   │                               mount proceeds                         │
   └──────────────────────────────────────────────────────────────────────┘
@@ -521,7 +521,7 @@
   SECTION 8 : Invariants
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  C-1  At most one LOCK_EX holder exists at any time for a given .vmlock.
+  C-1  At most one LOCK_EX holder exists at any time for a given vmlock.
          This is enforced by the kernel (FlockLockProvider, FcntlLockProvider)
          or by the external coordination service (ExternalLockProvider).
 
@@ -531,15 +531,15 @@
   C-3  A read-only mount holds LOCK_SH for its entire lifetime.
          It never upgrades to LOCK_EX.
 
-  C-4  .vmdirty is written only by the LOCK_EX holder.
-         No read-only mount appends records to .vmdirty.
+  C-4  vmdirty is written only by the LOCK_EX holder.
+         No read-only mount appends records to vmdirty.
 
   C-5  On crash (FlockLockProvider / FcntlLockProvider), the kernel
          releases the lock before any subsequent open() can proceed past
          lock acquisition.  A new mount always sees a fully consistent
-         .vmdirty for the crashed session.
+         vmdirty for the crashed session.
 
-  C-6  flock() on .vmlock is independent of any lock on archive.zip.
+  C-6  flock() on vmlock is independent of any lock on archive.zip.
          Third-party tools that open archive.zip are not affected by
          the VMM lock, and do not interfere with it.
 
@@ -582,7 +582,7 @@
         are naturally sequential in a typical build graph.
 
     Incremental archival with periodic commits
-        A long-running process accumulates writes in .vmdirty, calls
+        A long-running process accumulates writes in vmdirty, calls
         commit() at checkpoints (hourly, after N writes, etc.), and
         remains open between checkpoints.  Read-only access is unavailable
         during the session but commits are infrequent relative to the
@@ -677,15 +677,15 @@
           targeting different entries both need to update the CD; without
           a CD-level lock, their updates would interleave destructively.
 
-      .vmdirty journal
+      vmdirty journal
           The spill journal is append-only and single-writer.  Concurrent
           dirty sessions from different processes cannot safely share a
-          single .vmdirty file under the current record format.  Supporting
+          single vmdirty file under the current record format.  Supporting
           concurrent writers would require either per-writer journal files
           with a merge protocol at commit time, or a multi-writer journal
           format with sequence namespacing per writer.
 
-      .vmidx seek index
+      vmidx seek index
           Index updates on commit are per-entry, but the index file header
           (fingerprint, archive metadata) is shared.  Concurrent index
           updates require either a readers-writer lock on the index file or
@@ -694,24 +694,24 @@
   Viable approach for a fine-grained extension:
 
     1. Shard the entry namespace into G shards (e.g., by hash of entry path).
-       Each shard has its own .vmlock_N file.  Writers acquire LOCK_EX only
+       Each shard has its own vmlock_N file.  Writers acquire LOCK_EX only
        on the shards containing their target entries; readers acquire LOCK_SH
        on the same shards.
 
-    2. Add a CD lock ( .vmlock_cd ), separate from entry shard locks.
-       Writers acquire LOCK_EX on .vmlock_cd only during the CD-write phase
+    2. Add a CD lock ( vmlock_cd ), separate from entry shard locks.
+       Writers acquire LOCK_EX on vmlock_cd only during the CD-write phase
        of commit(), not for the entire session.  This reduces CD contention
        to the duration of the CD write, not the entire work unit.
 
-    3. Per-writer .vmdirty files ( .vmdirty_<writer_id> ).
+    3. Per-writer vmdirty files ( vmdirty_<writer_id> ).
        Each concurrent writer spills to its own journal.  At commit time,
        the writer merges its journal into the archive and deletes the file.
-       Recovery discovers all .vmdirty_* files and replays them in order
+       Recovery discovers all vmdirty_* files and replays them in order
        of their embedded sequence numbers.
 
-    4. .vmidx shard files ( .vmidx_N ) corresponding to entry shards.
+    4. vmidx shard files ( vmidx_N ) corresponding to entry shards.
        Each shard's index is updated independently.  A global index header
-       file ( .vmidx_header ) is updated under a short exclusive lock at
+       file ( vmidx_header ) is updated under a short exclusive lock at
        commit() completion.
 
   API changes required:
@@ -732,7 +732,7 @@
     without shard index files are treated as a single shard (G=1),
     which reduces to the current coarse-grained behaviour.  The
     LockProvider interface requires no changes; each shard instantiates
-    its own LockProvider for its .vmlock_N file.
+    its own LockProvider for its vmlock_N file.
 
   This extension is not part of the current implementation.  The current
   design satisfies all workloads within the stated use case scope.  The

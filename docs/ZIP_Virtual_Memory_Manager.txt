@@ -13,7 +13,7 @@
   at all times until commit() completes.  Commit paths that write inside the
   existing archive file (freelist hole reuse, VMM-native in-place, STORE
   in-place) do so only on byte ranges that are either unreferenced by the
-  live Central Directory or fully recoverable from the .vmdirty journal;
+  live Central Directory or fully recoverable from the vmdirty journal;
   see CRASH SAFETY OF IN-PLACE COMMIT.
 
 
@@ -26,7 +26,7 @@
   document:
 
     rename(2)        atomic file replacement       ( FULL commit )
-    flock(2)         advisory locking              ( .vmlock protocol )
+    flock(2)         advisory locking              ( vmlock protocol )
     fdatasync(2)     durable write barrier         ( commit / flush ordering )
     stat(2) st_ino   file identity                 ( ESTALE fingerprint )
     mmap(2)          shared read-only mapping      ( vmidx access )
@@ -85,7 +85,7 @@
            │ cache miss
            ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  LAYER 3 : Seek Index  ( archive.zip.vmidx )                                 │
+│  LAYER 3 : Seek Index  ( archive.zip.vmm/vmidx )                                 │
 │                                                                              │
 │   Built on first open.  Stored as a sidecar file alongside archive.zip.     │
 │   Rebuilt only when the source ZIP changes.                                  │
@@ -142,7 +142,7 @@
        ├─ Diff Layer (Tier 1 hot store): page present?
        │       YES → return page data
        │
-       ├─ Diff Layer (Tier 2 spill file, .vmdirty): page present?
+       ├─ Diff Layer (Tier 2 spill file, vmdirty): page present?
        │       YES → return page data
        │
        ├─ Page Cache: page present?
@@ -208,7 +208,7 @@
        │       YES → update data in-place, re-stamp as newest
        │
        ├─ Page already in Diff Layer Tier 2?
-       │       YES → append new DATA RECORD to .vmdirty (supersedes prior)
+       │       YES → append new DATA RECORD to vmdirty (supersedes prior)
        │
        └─ Page not yet dirty:
                load from Page Cache or Source ZIP (copy-on-write)
@@ -228,7 +228,7 @@
   All of them act on the Diff Layer and the in-memory entry table only;
   the source archive is modified exclusively by commit(), exactly as for
   page writes.  Each operation is journaled as a METADATA RECORD in
-  .vmdirty (see vmdirty Journal Specification, Section 1) and is
+  vmdirty (see vmdirty Journal Specification, Section 1) and is
   recoverable under the same protocol as dirty pages.
 
   Entry sizes:
@@ -331,7 +331,7 @@
        │
        ├─ [VMM-native DEFLATE in-place path]  ( VMM-generated archives only )
        │       Block completion journaling ( prerequisite for any overwrite ):
-       │           spill the CLEAN pages of every dirty block to .vmdirty
+       │           spill the CLEAN pages of every dirty block to vmdirty
        │           write COMMIT MARKER → fdatasync()
        │           ( see CRASH SAFETY OF IN-PLACE COMMIT )
        │       For each modified entry with VMM-native DEFLATE encoding:
@@ -355,13 +355,13 @@
        │           Crash before rename : source ZIP survives intact
        │           Crash after  rename : new ZIP is complete and valid
        │
-       ├─ Update archive.zip.vmidx for modified entries only, and refresh
-       │  the .vmidx header fingerprint ( file_size, inode, mtime_ns,
+       ├─ Update archive.zip.vmm/vmidx for modified entries only, and refresh
+       │  the vmidx header fingerprint ( file_size, inode, mtime_ns,
        │  cd_hash ).  The FULL path replaces the archive inode via
        │  rename(); without the refresh, the next open() would
        │  invalidate the entire index.
        │
-       └─ Delete archive.zip.vmdirty
+       └─ Delete archive.zip.vmm/vmdirty
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -472,7 +472,7 @@
 
     Background compaction initiates the FULL commit path on a background
     thread and returns immediately.  New write()s accepted during the
-    build phase accumulate in .vmdirty normally.  See BACKGROUND COMMIT
+    build phase accumulate in vmdirty normally.  See BACKGROUND COMMIT
     for the full specification of the background commit mechanism, which
     uses an identical implementation.
 
@@ -620,7 +620,7 @@
   (2) VMM-native in-place requires block completion journaling.
 
       Overwriting a block destroys its prior compressed bytes.  The
-      .vmdirty journal contains the dirty pages of that block, but not
+      vmdirty journal contains the dirty pages of that block, but not
       its clean pages — before the overwrite, those exist only inside
       the block being destroyed.  Without additional journaling, a torn
       overwrite would lose the clean pages permanently.
@@ -629,24 +629,24 @@
 
         a. For every block selected for in-place overwrite, read the
            block's clean pages from the source archive and append them
-           to .vmdirty as ordinary DATA RECORDs.
+           to vmdirty as ordinary DATA RECORDs.
         b. Write a COMMIT MARKER.
-        c. fdatasync( .vmdirty ).
+        c. fdatasync( vmdirty ).
 
       After this barrier, every page of every block that will be
-      overwritten is durable in .vmdirty.  A crash during any subsequent
+      overwritten is durable in vmdirty.  A crash during any subsequent
       overwrite is handled by the standard recovery protocol at next
       open(): recovery restores all pages of the affected blocks, and
       the following commit rewrites those blocks in full.  The journal
       cost is bounded by block_size per dirty block.
 
-      .vmdirty deletion (the final step of commit) must not occur until
+      vmdirty deletion (the final step of commit) must not occur until
       all in-place writes have been fdatasync()ed.
 
   (3) STORE in-place is safe with page-exact writes.
 
       The overwritten byte ranges correspond exactly to the dirty pages
-      already journaled in .vmdirty.  No before-image is needed: after a
+      already journaled in vmdirty.  No before-image is needed: after a
       torn write, recovery re-applies the same pages over the same
       ranges, yielding the committed content.  Implementations must
       write only the dirty page ranges, never a surrounding aligned
@@ -664,7 +664,7 @@
   Without background commit, the only mechanism for removing dead space is
   synchronous FULL compaction, which blocks the caller for the duration of a
   full archive rewrite.  Background commit resolves this asymmetry: the
-  .vmdirty journal already has background compaction (Section 10 of the
+  vmdirty journal already has background compaction (Section 10 of the
   vmdirty Journal Specification); background commit brings equivalent
   non-blocking behaviour to the ZIP itself.
 
@@ -672,7 +672,7 @@
 
     1. SNAPSHOT
          The VMM records snapshot_boundary = the highest sequence_num
-         currently present in .vmdirty (or 0 if no spill has occurred).
+         currently present in vmdirty (or 0 if no spill has occurred).
          All dirty pages in Tier 1 and Tier 2 with sequence ≤
          snapshot_boundary constitute the snapshot set S.
          Pages with sequence > snapshot_boundary constitute the delta
@@ -701,8 +701,8 @@
     4. RENAME
          rename(archive.new.zip → archive.zip)   ← POSIX atomic.
          All dirty state through D is now contained in archive.zip.
-         Clear Diff Layer (Tier 1 + Tier 2); delete .vmdirty.
-         Update .vmidx for all modified entries and refresh the .vmidx
+         Clear Diff Layer (Tier 1 + Tier 2); delete vmdirty.
+         Update vmidx for all modified entries and refresh the vmidx
          header fingerprint ( the rename replaced the archive inode ).
          Mount transitions to CLEAN.
 
@@ -733,7 +733,7 @@
         Requests cancellation.
         BUILD not yet started:     abort; archive.zip unchanged.
         BUILD in progress:         discard archive.new.zip; mount remains
-                                   DIRTY with S ∪ D intact in .vmdirty.
+                                   DIRTY with S ∪ D intact in vmdirty.
         MERGE or RENAME in progress: cancellation is not possible;
                                    wait() is implied.
 
@@ -745,7 +745,7 @@
   Concurrent operations:
 
     flush() during BUILD:
-        Proceeds normally.  Writes a COMMIT MARKER to .vmdirty covering
+        Proceeds normally.  Writes a COMMIT MARKER to vmdirty covering
         pages spilled at that moment.  The background thread is unaffected.
 
     commit(mode=SYNC) while a background commit is active:
@@ -766,18 +766,18 @@
 
     Crash during BUILD:
         archive.zip is unchanged.  archive.new.zip is an orphan and
-        is removed silently at next open().  .vmdirty contains S ∪ D
+        is removed silently at next open().  vmdirty contains S ∪ D
         and is fully recoverable via the standard recovery protocol.
 
     Crash during MERGE:
         archive.new.zip contains S but not D.  archive.zip is unchanged
         (RENAME not yet issued).  archive.new.zip orphan is removed at
-        next open().  .vmdirty contains S ∪ D; fully recoverable.
+        next open().  vmdirty contains S ∪ D; fully recoverable.
 
-    Crash after RENAME, before .vmdirty deletion:
+    Crash after RENAME, before vmdirty deletion:
         archive.zip is the compacted file containing S ∪ D (applied in
-        MERGE).  .vmdirty may still be present.  Recovery at next open()
-        applies .vmdirty pages to the compacted archive.zip.  This is
+        MERGE).  vmdirty may still be present.  Recovery at next open()
+        applies vmdirty pages to the compacted archive.zip.  This is
         correct: FULL compaction does not alter logical content; any
         dirty page from S or D that was already committed to archive.zip
         results in an idempotent overwrite with the same data.
@@ -802,7 +802,7 @@
   Two flush modes (configured at mount time):
 
     STRICT (default)
-        All Tier 1 dirty pages are spilled to .vmdirty before the COMMIT
+        All Tier 1 dirty pages are spilled to vmdirty before the COMMIT
         MARKER is written.  fdatasync() is called.  Crash after flush()
         → full recovery guaranteed.
 
@@ -869,7 +869,7 @@
                     + local_file_header.file_name_length
                     + local_file_header.extra_field_length
 
-    No checkpoint data is stored in .vmidx for STORE entries.
+    No checkpoint data is stored in vmidx for STORE entries.
     The seek index records the entry as STORE with data_offset only.
     Read page N:  seek to data_offset + N * page_size, read page_size bytes.
 
@@ -920,7 +920,7 @@
              frame_offset[i]        = frame_offset[i-1] + compressed_size[i-1]
              uncompressed_offset[i] = uncompressed_offset[i-1]
                                     + decompressed_size[i-1]
-        5. Write one checkpoint per frame to .vmidx.
+        5. Write one checkpoint per frame to vmidx.
 
       build_index() for Zstandard is O(num_frames), not O(stream_length).
       There is no forward stream walk.
@@ -970,7 +970,7 @@
                                              larger decode cost per miss
 
       Frame size is written into each frame's Zstandard header and
-      recorded in .vmidx.  Third-party Zstandard decoders read the
+      recorded in vmidx.  Third-party Zstandard decoders read the
       seekable stream correctly regardless of frame size.
 
     Non-seekable Zstandard entries:
@@ -997,7 +997,7 @@
   SEEK INDEX SIZING
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  The seek index (.vmidx) is the primary factor governing random access cost
+  The seek index (vmidx) is the primary factor governing random access cost
   and memory use at mount time.  Checkpoint density, checkpoint size, and
   archive volume interact to determine both the worst-case seek distance and
   the index footprint.
@@ -1034,9 +1034,9 @@
   this entirely, reducing the index by three orders of magnitude.
 
   As a mitigation for standard DEFLATE, window snapshots may themselves be
-  stored compressed inside .vmidx (zlib level 1).  Window content typically
+  stored compressed inside vmidx (zlib level 1).  Window content typically
   compresses to roughly half its size, at the cost of one additional
-  decompression on each checkpoint restore.  This is an .vmidx-internal
+  decompression on each checkpoint restore.  This is a vmidx-internal
   representation choice; the checkpoint logical format is unchanged.
 
   Checkpoint interval and access cost:
@@ -1077,7 +1077,7 @@
 
     Distributed archive (archive.zip is read-only, AOT vmidx):
         Generate vmidx offline with --index-strategy=eager.
-        Distribute .vmidx alongside archive.zip.
+        Distribute vmidx alongside archive.zip.
         At 1 MB interval with Zstandard: vmidx is ~1.5 MB for a 100 GB archive.
         At 1 MB interval with standard DEFLATE: ~3 GB — distribute via
         a compressed channel or prefer VMM-native on new archives.
@@ -1089,7 +1089,7 @@
 
   Behaviour when vmidx does not fit in RAM:
 
-    The .vmidx file is mapped into the process address space via mmap() with
+    The vmidx file is mapped into the process address space via mmap() with
     PROT_READ and MAP_SHARED.  madvise(MADV_RANDOM) is applied: the OS is
     informed that access is non-sequential so it does not prefetch
     sequentially within the mapping.
@@ -1130,7 +1130,7 @@
     Hot entry detection:
 
       The VMM counts Page Cache misses per entry.  The miss count is
-      maintained in memory and flushed to the .vmidx per-entry header
+      maintained in memory and flushed to the vmidx per-entry header
       at close().  On subsequent opens, the persisted count initialises
       the in-memory counter.
 
@@ -1150,7 +1150,7 @@
       The re-index pass walks the DEFLATE stream for the hot entry from
       the first checkpoint and generates additional checkpoints at every
       adaptive_interval bytes.  New checkpoints are inserted into the
-      existing checkpoint list in .vmidx (which supports variable-density
+      existing checkpoint list in vmidx (which supports variable-density
       per-entry lists without format changes).
 
       After re-indexing, the worst-case seek cost for the hot entry drops
@@ -1226,7 +1226,7 @@
     VMM-native DEFLATE is produced only when:
       (a) The commit path is FULL (compaction), AND
       (b) The archive was last fully rewritten by the VMM (identified by a
-          VMM provenance flag in the .vmidx per-archive header), AND
+          VMM provenance flag in the vmidx per-archive header), AND
       (c) The mount option --vmm-native is active (default for new archives
           created via the VMM; opt-in for externally produced archives).
 
@@ -1292,7 +1292,7 @@
        vmidx block map: (block_index → compressed_offset, capacity).
 
     1b. Block completion journaling: for every block identified in step 1,
-        append its CLEAN pages (read from the source archive) to .vmdirty
+        append its CLEAN pages (read from the source archive) to vmdirty
         as DATA RECORDs, write a COMMIT MARKER, and fdatasync().
         No in-place overwrite may begin before this barrier completes.
         Rationale and crash argument: see CRASH SAFETY OF IN-PLACE COMMIT.
@@ -1317,7 +1317,7 @@
 
     3. fdatasync() after all in-place writes and any INCREMENTAL fallback.
 
-    4. Update .vmidx: new capacity values for blocks that were recompressed
+    4. Update vmidx: new capacity values for blocks that were recompressed
        in-place; new entry offset for any entries that fell back.
 
     No EOCD rewrite is needed unless step 2d triggered a CD update.
@@ -1344,10 +1344,10 @@
     ceil(recompressed_size / CAPACITY_ALIGN) × CAPACITY_ALIGN.
     This prevents perpetual over-allocation as data shrinks over time.
 
-  .vmidx checkpoint type:
+  vmidx checkpoint type:
 
     DEFLATE_VMM entries are distinguished from standard DEFLATE entries
-    in the .vmidx per-entry header by a provider_type field.  Checkpoint
+    in the vmidx per-entry header by a provider_type field.  Checkpoint
     records for DEFLATE_VMM entries carry (compressed_offset,
     uncompressed_offset, capacity); they carry no decoder_state bytes.
 
@@ -1371,7 +1371,7 @@
 
         commit_count_for_entry counts commits that modified the entry,
         not total mounts or total commits to the archive.  It is tracked
-        in the .vmidx per-entry header and survives across sessions.
+        in the vmidx per-entry header and survives across sessions.
 
     Automatic — overflow frequency:
         Overflow events in VMM-native DEFLATE exceed 3 in 10 commits for
@@ -1394,7 +1394,7 @@
     During FULL commit:
       1. The entry is written with method=0 (STORE).  Local File Header
          records method=0; data is the raw uncompressed bytes.
-      2. .vmidx updated: provider_type = STORE; data_offset recorded.
+      2. vmidx updated: provider_type = STORE; data_offset recorded.
          commit_count_for_entry reset to 0.  store_promoted flag set.
 
     Subsequent commits of a STORE-promoted entry:
@@ -1442,7 +1442,7 @@
   the advisory lock, an R/W mount holds LOCK_EX for its entire lifetime,
   preventing external modification.  An R/O mount holds LOCK_SH, which
   prevents another VMM mount from acquiring LOCK_EX but does not prevent
-  external processes that do not use the .vmlock protocol from writing to
+  external processes that do not use the vmlock protocol from writing to
   archive.zip.  On NFS or distributed storage, external modification can
   also occur due to replication or cache staleness.
 
@@ -1483,7 +1483,7 @@
     write() returns ESTALE regardless of Diff Layer state.
     flush() and commit() return ESTALE.
     close() proceeds normally and releases the advisory lock.
-    .vmdirty is not deleted on close() from STALE state; it is retained
+    vmdirty is not deleted on close() from STALE state; it is retained
     for recovery at the next open().
 
   Configuration:
@@ -1509,7 +1509,7 @@
     modification (tools that bypass the advisory lock).
 
     If ESTALE is detected on an R/W mount with a non-empty Diff Layer,
-    the dirty pages in Tier 1 and Tier 2 are preserved in .vmdirty.
+    the dirty pages in Tier 1 and Tier 2 are preserved in vmdirty.
     The CONFLICT resolution protocol applies at the next open():
     the caller decides whether to discard dirty pages or abort.
 
@@ -1527,7 +1527,7 @@
 
   The VMM handles ZIP64 extensions transparently.  All internal offsets
   (compressed position, uncompressed position, local header offset,
-  source_file_size in the .vmidx header) are stored as 64-bit quantities.
+  source_file_size in the vmidx header) are stored as 64-bit quantities.
   There is no 4 GB or 65 535-entry limit imposed by the VMM itself.
 
   Covered cases:
@@ -1540,7 +1540,7 @@
 
   The Central Directory is parsed with full ZIP64 end-of-central-directory
   locator support.  ZIP64 extra fields in local and central headers are
-  consumed during the DEFLATE Stream Walker pass that builds the .vmidx.
+  consumed during the DEFLATE Stream Walker pass that builds the vmidx.
 
   Non-ZIP64 archives are not affected; the code path is the same with
   32-bit field promotion to 64-bit.
@@ -1614,7 +1614,7 @@
 
     ENOSPC during synchronous spill:
         The triggering write() fails with ENOSPC.  The incoming page is
-        not accepted; Tier 1, Tier 2, and .vmdirty remain exactly as
+        not accepted; Tier 1, Tier 2, and vmdirty remain exactly as
         before the call.  The mount stays DIRTY and fully functional for
         read(), for flush() of already-spilled state, and for commit()
         — which may succeed via hole reuse, or fail the same way.
@@ -1627,17 +1627,17 @@
 
     ENOSPC during FULL commit:
         archive.new.zip is deleted; commit() fails; the mount remains
-        DIRTY; archive.zip and .vmdirty are untouched.
+        DIRTY; archive.zip and vmdirty are untouched.
 
     ENOSPC during INCREMENTAL commit:
         Possible only during the data / CD / EOCD appends.  The new EOCD
         was not durably written, so the archive is logically unchanged —
         an aborted commit is indistinguishable from a crash at the same
-        byte (see COMMIT STRATEGY, crash safety).  .vmdirty is retained;
+        byte (see COMMIT STRATEGY, crash safety).  vmdirty is retained;
         commit() may be retried after space is freed.
 
   Class 3 — integrity faults
-  ( fdatasync() failure, .vmdirty write error, CRC mismatch on a
+  ( fdatasync() failure, vmdirty write error, CRC mismatch on a
     structure the VMM itself wrote ):
 
       fdatasync() failure is treated as loss of the durability
@@ -1646,7 +1646,7 @@
       in-process state still holds it (the post-2018 fsync semantics
       lesson).  The mount transitions to ERROR state: read() of Tier 1
       and Tier 2 content continues to be served; write(), flush(), and
-      commit() return EIO.  .vmdirty is retained on close() for
+      commit() return EIO.  vmdirty is retained on close() for
       recovery, where every record is re-validated by CRC — records
       that did not survive are detected rather than trusted.
 
@@ -1659,7 +1659,7 @@
 
   open( archive.zip )
        │
-       ├─ archive.zip.vmidx present and fingerprint valid?
+       ├─ archive.zip.vmm/vmidx present and fingerprint valid?
        │       YES → load index, mount immediately
        │       NO  → run DEFLATE Stream Walker according to index build strategy
        │                   │
@@ -1667,14 +1667,14 @@
        │                   │    provider = lookup(method_code)
        │                   │    provider present:
        │                   │      call provider.build_index(stream)
-       │                   │      write checkpoints to .vmidx
+       │                   │      write checkpoints to vmidx
        │                   │    provider absent:
        │                   │      record as UNSUPPORTED_COMPRESSION
        │                   │
-       │                   └─→ Write archive.zip.vmidx
+       │                   └─→ Write archive.zip.vmm/vmidx
        │                         ( source ZIP is not modified )
        │
-       ├─ archive.zip.vmdirty present?
+       ├─ archive.zip.vmm/vmdirty present?
        │       YES → run recovery protocol (see vmdirty Journal Specification)
        │       NO  → proceed
        │
@@ -1685,7 +1685,7 @@
 
   Index build strategy  ( configured at mount time ):
 
-  The .vmidx format is identical regardless of which strategy produced it.
+  The vmidx format is identical regardless of which strategy produced it.
   The strategy governs only when checkpoints are generated, not their content.
 
   EAGER  ( default, --index-strategy=eager )
@@ -1705,7 +1705,7 @@
           decompressed forward from the nearest existing checkpoint, writing
           new checkpoints at every interval along the way.
         - STORE entries are always immediately accessible.
-        - .vmidx is written incrementally as checkpoints are generated.
+        - vmidx is written incrementally as checkpoints are generated.
 
       Cost per cold access:  O( distance_from_nearest_checkpoint ).
       Coverage converges toward completeness as regions are accessed.
@@ -1714,7 +1714,7 @@
 
       open() reads only the Central Directory and returns immediately.
       A background thread performs the full Stream Walker pass, writing
-      checkpoints to .vmidx as they are generated.
+      checkpoints to vmidx as they are generated.
       Foreground reads that request an unindexed region fall back to
       on-demand decompression (identical to LAZY behaviour) until the
       background thread has covered that region.
@@ -1724,11 +1724,11 @@
 
   AOT  ( ahead-of-time )
 
-      .vmidx is pre-generated and distributed alongside archive.zip.
+      vmidx is pre-generated and distributed alongside archive.zip.
       open() loads the index with no build cost.
       Suitable when archive.zip is produced by a controlled build pipeline
       where the index can be generated during the build step.
-      The fingerprint in the pre-built .vmidx must match the distributed
+      The fingerprint in the pre-built vmidx must match the distributed
       archive.zip; a mismatch causes a rebuild under the active strategy.
 
 
@@ -1782,7 +1782,7 @@
   CONCURRENT ACCESS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  The VMM uses an advisory lock on the sidecar file archive.zip.vmlock
+  The VMM uses an advisory lock on the sidecar file archive.zip.vmm/vmlock
   to coordinate access when multiple processes open the same archive.
   Lock acquisition is delegated to a LockProvider, allowing the locking
   mechanism to be configured per mount without altering VMM semantics.
@@ -1790,18 +1790,18 @@
   Lock modes:
 
     Read-write mount (default)
-        Acquires LOCK_EX on archive.zip.vmlock.
+        Acquires LOCK_EX on archive.zip.vmm/vmlock.
         Blocks until all other mounts (read-only and read-write) release.
         At most one read-write mount may be active at any time.
 
     Read-only mount  ( --read-only )
-        Acquires LOCK_SH on archive.zip.vmlock.
+        Acquires LOCK_SH on archive.zip.vmm/vmlock.
         Multiple read-only mounts may coexist.
         Blocked while any read-write mount holds LOCK_EX.
 
   The lock is held for the lifetime of the mount and released at close()
   or on process exit (kernel releases flock() locks automatically).
-  A .vmlock file is created if absent; its presence does not indicate
+  A vmlock file is created if absent; its presence does not indicate
   a lock is currently held.
 
   Full locking semantics, platform behaviour, LockProvider interface,
@@ -1814,30 +1814,55 @@
   SIDECAR FILES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Sidecar file set
+  Sidecar directory
 
-    archive.zip                   source ZIP (read-only until commit)
-    archive.zip.vmidx             seek index (rebuilt if absent or stale)
-    archive.zip.vmlock            advisory lock coordination file
-    archive.zip.vmdirty           spill journal (present only during dirty session)
-    archive.zip.vmdirty.bak.{id}  recovered spill journal (retained for forensics)
-    archive.zip.vmdirty.compact   journal compaction scratch file (transient)
-    archive.new.zip               commit scratch file (transient; FULL path only)
+    All VMM state for an archive lives in a single sidecar directory
+    beside it:
 
-    archive.zip.vmdirty.compact is present only while a journal compaction is in
-    progress.  A file found at this path at open() time with no active mount is
-    an orphan from an interrupted compaction and is removed silently.
+    archive.zip                source ZIP (read-only until commit)
+    archive.zip.vmm/           sidecar directory (created at first open)
+      vmidx                    seek index (rebuilt if absent or stale)
+      vmlock                   advisory lock coordination file
+      vmdirty                  spill journal (present only during dirty session)
+      vmdirty.bak.{id}         recovered spill journal (retained for forensics)
+      vmdirty.compact          journal compaction scratch file (transient)
+    archive.new.zip            commit scratch file (transient; FULL path
+                               only).  Kept beside archive.zip, not inside
+                               the sidecar directory, because it replaces
+                               archive.zip via rename().
+
+    vmdirty.compact is present only while a journal compaction is in
+    progress.  A file found at this path at open() time with no active mount
+    is an orphan from an interrupted compaction and is removed silently.
 
     archive.new.zip is present only while a FULL (compaction) commit is in
     progress (synchronous or background).  A file found at this path at open()
     time with no active mount is an orphan from an interrupted full commit
     and is removed silently.
 
+  Directory creation and durability
+
+    The first open() creates the sidecar directory with mkdir() and makes
+    the creation durable by fsync()ing the parent directory before any
+    sidecar file is written.  An empty or partially populated sidecar
+    directory is never an error: every member is individually validated
+    or rebuilt.
+
+  Deletion warning
+
+    Never delete the sidecar directory (or vmlock inside it) while any
+    mount is active.  Deleting and recreating vmlock while a process
+    holds its lock gives a second process a lock on a different inode;
+    both then believe they hold exclusivity.  With no mounts active,
+    deleting the directory is always safe: vmidx is rebuilt at next
+    open(), and an absent vmdirty simply means there is no dirty session
+    to recover.
+
   Default co-location
 
-    All sidecar files reside in the same directory as archive.zip, using
-    archive.zip's filename as a prefix.  This is the default behaviour when
-    no sidecar_dir is configured.
+    The sidecar directory resides in the same directory as archive.zip,
+    using archive.zip's filename as a prefix.  This is the default
+    behaviour when no sidecar_dir is configured.
 
     Co-location is the default deliberately.  The association between an
     archive and its sidecar state is physically unambiguous: it does not
@@ -1854,15 +1879,18 @@
 
     mount(path, sidecar_dir="/path/to/sidecar/directory")
 
-    All sidecar files are written to the specified directory instead of the
-    directory containing archive.zip.  Within sidecar_dir, each file is
+    The sidecar directory is placed inside the specified directory instead
+    of beside archive.zip.  Within sidecar_dir, each archive's directory is
     named using an 8-character hex prefix derived from a SHA-256 hash of
     the archive's canonical absolute path, combined with the archive filename:
 
-        {hex8}_{archive_filename}.vmidx
-        {hex8}_{archive_filename}.vmlock
-        {hex8}_{archive_filename}.vmdirty
-        ...
+        {sidecar_dir}/
+          vmm_registry
+          {hex8}_{archive_filename}.vmm/
+            vmidx
+            vmlock
+            vmdirty
+            ...
 
     The hex8 prefix prevents collisions between archives with the same
     filename in different directories.  The filename component preserves
@@ -1887,7 +1915,7 @@
          by fingerprint.  A fingerprint match recovers sidecar files even
          when the archive has been moved or renamed on disk.
       3. If no match is found in the registry, proceeds as a cold open
-         (rebuilds .vmidx; no prior dirty state).
+         (rebuilds vmidx; no prior dirty state).
 
     The registry is updated on every open() with the current canonical path
     and fingerprint of the archive being mounted.
@@ -1895,14 +1923,14 @@
   Portability note
 
     Moving archive.zip to another location requires either:
-      (a) Moving all co-located sidecar files alongside it, or
+      (a) Moving the co-located sidecar directory alongside it, or
       (b) Configuring a stable sidecar_dir so that sidecar files remain
           accessible at their fixed path; the registry enables fingerprint-
           based recovery even after the archive path changes.
 
-    A ZIP without its .vmidx is still a valid ZIP; first-open rebuilds the index.
-    A ZIP without its .vmlock is still usable; the file is created at next open().
-    A ZIP without its .vmdirty means any unrecovered dirty pages from a prior
+    A ZIP without its vmidx is still a valid ZIP; first-open rebuilds the index.
+    A ZIP without its vmlock is still usable; the file is created at next open().
+    A ZIP without its vmdirty means any unrecovered dirty pages from a prior
     session are lost; the source ZIP itself remains intact.
 
 
@@ -1912,14 +1940,14 @@
 
   Scenario                                           Result
   ─────────────────────────────────────────────────────────────────────────────
-  Open with VMM, .vmidx present and valid            fast random access
-  Open with VMM, .vmidx absent or stale             slow first-open, then fast
-  Open with standard unzip / 7-Zip / WinZip          works perfectly (.vmidx
-                                                     and .vmlock are ignored)
-  Copy archive.zip without sidecar files             works as a normal ZIP;
+  Open with VMM, vmidx present and valid            fast random access
+  Open with VMM, vmidx absent or stale             slow first-open, then fast
+  Open with standard unzip / 7-Zip / WinZip          fully compatible (the
+                                                     .vmm directory is ignored)
+  Copy archive.zip without its .vmm directory        works as a normal ZIP;
                                                      sidecar_dir registry may
                                                      recover state by fingerprint
-  archive.zip modified externally                    .vmidx invalidated;
+  archive.zip modified externally                    vmidx invalidated;
                                                      rebuilt on next open;
                                                      ESTALE returned on Page
                                                      Cache miss during active
