@@ -1,0 +1,8 @@
+# IDE
+.idea/
+
+# Python
+.venv/
+
+# 整理前ファイルの一時退避場所 (内容は git 履歴に保存済み)
+_archive/
