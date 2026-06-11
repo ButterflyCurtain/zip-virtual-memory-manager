@@ -320,6 +320,13 @@
     fcntl() locks; no special post-fork cleanup is needed for this
     provider.
 
+    Per-process ownership also means fcntl() cannot arbitrate between
+    two mounts within a single process: the second acquisition succeeds
+    trivially because the process already owns the lock.  Same-process
+    double-mount of one archive requires FlockLockProvider or a single
+    shared mount instance (see THREAD MODEL in the main architecture
+    document).
+
     Suitable for NFS mounts where cross-host locking is required.
 
   ExternalLockProvider

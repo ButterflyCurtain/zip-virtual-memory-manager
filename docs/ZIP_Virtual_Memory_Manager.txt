@@ -1547,6 +1547,111 @@
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  UNTRUSTED ARCHIVES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The VMM may be pointed at archives it did not produce.  Parsing is
+  hardened against malformed and adversarial input.  The goal is
+  containment — bounded resource use and clean errors — not authenticity:
+  cd_hash and full_hash are integrity checks against accidental
+  corruption, not message authentication codes, and prove nothing about
+  origin.  Deployments that require authenticity must sign archives
+  through an external mechanism.
+
+  Structural validation at open():
+
+    - CD entry count, offsets, and sizes are bounds-checked against the
+      file size before any allocation proportional to them is made.
+    - Entry regions are checked for overlap during Dead Space Freelist
+      construction.  Overlapping entries (a known zip-quine and
+      content-smuggling construction) fail open() with ARCHIVE_MALFORMED.
+    - Duplicate entry names: the LAST Central Directory entry wins,
+      matching the behaviour of common extractors; a diagnostic is
+      logged.  --strict-archive rejects duplicates with ARCHIVE_MALFORMED.
+    - Local File Header fields that disagree with the CD are ignored in
+      favour of the CD, except data offsets, which are validated to lie
+      within the file.
+
+  Resource bounds  ( all configurable at mount time ):
+
+    max_entries             default 1 000 000
+    max_entry_name_len      default 4 096 bytes
+    max_uncompressed_size   per entry; default unlimited.  The declared
+                            uncompressed size from the CD is enforced
+                            during decompression: a stream producing
+                            more output than declared fails with
+                            ARCHIVE_MALFORMED rather than expanding.
+    max_compression_ratio   default 10 000 : 1 per entry; exceeding it
+                            during index construction or read fails the
+                            entry with ARCHIVE_MALFORMED (zip-bomb guard).
+
+  Entry names are opaque keys:
+
+    The VMM never derives filesystem paths from entry names.  Names
+    containing "..", absolute prefixes, drive letters, or backslashes
+    are stored and matched verbatim; path traversal is a concern only
+    for applications that extract entries to a filesystem, which is
+    outside the VMM's API surface.  Names must be valid UTF-8 without
+    NUL bytes; violations fail the entry with ARCHIVE_MALFORMED.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ERROR SEMANTICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Errors fall into three classes with distinct state guarantees.
+
+  Class 1 — caller errors
+  ( ENOENT, EEXIST, EROFS, EINVAL, ESTALE, LOCK_CONTENTION,
+    COMMIT_IN_PROGRESS, FORK_BOUNDARY_VIOLATION, UNSUPPORTED_COMPRESSION,
+    ARCHIVE_MALFORMED ):
+
+      No state change.  The operation is rejected atomically; the mount
+      remains in its prior state (except ESTALE and ARCHIVE_MALFORMED,
+      whose state transitions are specified in their own sections).
+
+  Class 2 — resource exhaustion:
+
+    ENOSPC during synchronous spill:
+        The triggering write() fails with ENOSPC.  The incoming page is
+        not accepted; Tier 1, Tier 2, and .vmdirty remain exactly as
+        before the call.  The mount stays DIRTY and fully functional for
+        read(), for flush() of already-spilled state, and for commit()
+        — which may succeed via hole reuse, or fail the same way.
+
+    ENOSPC during asynchronous spill:
+        The spill thread parks.  The error is surfaced on the next
+        write(), flush(), or commit() as ENOSPC with the same
+        no-state-change contract for that call.  Enqueued pages remain
+        in Tier 1; nothing is dropped.
+
+    ENOSPC during FULL commit:
+        archive.new.zip is deleted; commit() fails; the mount remains
+        DIRTY; archive.zip and .vmdirty are untouched.
+
+    ENOSPC during INCREMENTAL commit:
+        Possible only during the data / CD / EOCD appends.  The new EOCD
+        was not durably written, so the archive is logically unchanged —
+        an aborted commit is indistinguishable from a crash at the same
+        byte (see COMMIT STRATEGY, crash safety).  .vmdirty is retained;
+        commit() may be retried after space is freed.
+
+  Class 3 — integrity faults
+  ( fdatasync() failure, .vmdirty write error, CRC mismatch on a
+    structure the VMM itself wrote ):
+
+      fdatasync() failure is treated as loss of the durability
+      guarantee, not as a retryable error: after a failed fdatasync(),
+      the kernel may have discarded dirty page-cache content while
+      in-process state still holds it (the post-2018 fsync semantics
+      lesson).  The mount transitions to ERROR state: read() of Tier 1
+      and Tier 2 content continues to be served; write(), flush(), and
+      commit() return EIO.  .vmdirty is retained on close() for
+      recovery, where every record is re-validated by CRC — records
+      that did not survive are detected rather than trusted.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   FIRST-OPEN INITIALIZATION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1625,6 +1730,52 @@
       where the index can be generated during the build step.
       The fingerprint in the pre-built .vmidx must match the distributed
       archive.zip; a mismatch causes a rebuild under the active strategy.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  THREAD MODEL  ( intra-process )
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The Concurrent Access specification governs coordination BETWEEN
+  processes.  Within a single process, one VmmMount instance may be
+  shared by multiple threads under the following contract:
+
+    read()                    Concurrent with other read()s.  Takes the
+                              mount's reader-writer lock in shared mode;
+                              Page Cache and Tier 1 / Tier 2 lookups are
+                              protected by it.
+
+    write(), create(),        Serialised by the mount's single write
+    truncate(), remove(),     mutex.  Concurrent calls do not corrupt
+    rename()                  state; their order is the mutex
+                              acquisition order.
+
+    flush(), commit(),        Exclusive: take the write mutex AND drain
+    compact()                 in-flight reads before proceeding.  The
+                              bulk of commit I/O happens outside the
+                              lock (see BACKGROUND COMMIT, MERGE phase).
+
+    close()                   Must be externally ordered: no other call
+                              may race with close().  Calls issued after
+                              close() fail immediately.
+
+  Background threads: at most one spill thread (--async-spill), one
+  index thread (--index-strategy=background), and one commit thread
+  (BACKGROUND commit) exist per mount.  Their synchronisation points
+  are specified in their respective sections.
+
+  Memory visibility follows from the locks above.  No mount field is
+  accessed outside a lock except monotonic statistics counters, which
+  are relaxed atomics.
+
+  Distinct VmmMount instances in one process targeting DIFFERENT
+  archives are fully independent.  Two instances in one process
+  targeting the SAME archive are arbitrated by the vmlock protocol like
+  two processes — but note that FcntlLockProvider cannot arbitrate
+  within a single process (fcntl locks are owned per process; the
+  process already holds the lock).  Same-process double-mount of one
+  archive requires FlockLockProvider (per-open-file-description
+  semantics) or a single shared mount instance.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
