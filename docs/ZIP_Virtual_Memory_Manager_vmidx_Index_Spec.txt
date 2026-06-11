@@ -1,0 +1,375 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                                                                              ║
+║                        ZIP Virtual Memory Manager                            ║
+║                        vmidx Index Specification                             ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+  The vmidx file is the persistent seek index: per-entry metadata and
+  decompression checkpoints that make random access into compressed ZIP
+  entries cheap.  It lives in the sidecar directory (archive.zip.vmm/vmidx)
+  and is mapped read-only into the process address space at mount time.
+
+  The single most important property of vmidx, and the one that shapes
+  every format decision below, is:
+
+      vmidx is a CACHE.  It contains no user data.  Every byte of it is
+      reconstructible from archive.zip alone.  Corruption, truncation,
+      or loss of vmidx can cost time (a rebuild) but can never cost data.
+
+  This is the opposite of the vmdirty journal, which is the only copy of
+  uncommitted user data and is engineered for durability.  vmidx is
+  engineered for cheap reads and cheap incremental updates; on any
+  validation failure the response is always: discard and rebuild.
+
+  Design requirements:
+
+    - mmap-friendly read path: fixed-width, aligned structures; binary
+      search without deserialisation.  All multi-byte integers are
+      little-endian.  All offsets are byte offsets from file start.
+
+    - Append-friendly growth: LAZY and BACKGROUND index strategies and
+      adaptive checkpointing add checkpoints during a session without
+      rewriting the file (see Section 6).
+
+    - Detectable invalidity: header and records carry CRC-32C so that a
+      torn update is detected and answered with a rebuild, never with
+      wrong seek offsets.
+
+    - Advisory state is segregated: counters that merely tune behaviour
+      (miss counts, overflow streaks) live in an unprotected region
+      whose loss is harmless.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 1 : File Layout
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  [ FILE HEADER       ]   fixed 128 bytes, offset 0                       │
+  │  [ ENTRY TABLE       ]   entry_count × 96 bytes, sorted by name_hash     │
+  │  [ NAME HEAP         ]   concatenated UTF-8 entry names, no separators   │
+  │  [ ADVISORY REGION   ]   counters; not CRC-protected; updated in place   │
+  │  [ CHECKPOINT CHUNKS ]   append zone; grows to EOF during a session      │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  The first four regions are written together by any structural rewrite
+  (Section 6) and are never moved during a session.  Checkpoint chunks
+  are only ever appended; a structural rewrite consolidates them.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 2 : File Header
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  FILE HEADER  ( fixed 128 bytes, offset 0 )                              │
+  │                                                                          │
+  │  offset  size  field                  notes                              │
+  │  ──────  ────  ─────────────────────  ─────────────────────────────────  │
+  │    0      8    magic                  "VMIDX\0\0\0"                      │
+  │                                       0x56 4D 49 44 58 00 00 00          │
+  │    8      2    format_version         0x0001                             │
+  │   10      2    flags                  see FLAG BITS below                │
+  │   12      4    page_size              must equal the mount's page_size   │
+  │   16      8    checkpoint_interval    base interval in uncompressed      │
+  │                                       bytes ( default 1 048 576 )        │
+  │   24      8    source_file_size       stat().st_size of archive.zip      │
+  │   32      8    source_inode           stat().st_ino of archive.zip       │
+  │   40      8    source_mtime_ns        stat().st_mtime_ns of archive.zip  │
+  │   48     20    source_cd_hash         XXH3-128 of Central Directory      │
+  │                                       block (16 bytes) + 4 bytes zero    │
+  │                                       padding                            │
+  │   68      4    reserved               0x00000000                         │
+  │   72      8    entry_count                                               │
+  │   80      8    entry_table_offset     normally 128                       │
+  │   88      8    name_heap_offset                                          │
+  │   96      8    name_heap_size                                            │
+  │  104      8    advisory_offset                                           │
+  │  112      8    advisory_size                                             │
+  │  120      4    header_crc32           CRC-32C of bytes [0 .. 119]        │
+  │  124      4    padding                0x00000000                         │
+  │                                                                          │
+  │  Total: 128 bytes                                                        │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  FLAG BITS  ( flags field, 16 bits )
+
+    bit 0   VMM_GENERATED        provenance flag: the archive was last
+                                 fully rewritten by the VMM.  Gates the
+                                 VMM-native DEFLATE in-place commit path.
+    bit 1   WINDOWS_COMPRESSED   standard-DEFLATE window snapshots are
+                                 stored zlib-compressed (Section 5)
+    bits 2–15  reserved; must be 0
+
+  The fingerprint fields (source_file_size, source_inode, source_mtime_ns,
+  source_cd_hash) are validated against archive.zip at open() under the
+  cascade defined in the Diff Layer / Integrity Detection specification,
+  and refreshed by commit() (the FULL path replaces the archive inode via
+  rename(); without the refresh the next open() would rebuild needlessly).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 3 : Entry Table and Name Heap
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  ENTRY RECORD  ( fixed 96 bytes )                                        │
+  │                                                                          │
+  │  offset  size  field                    notes                            │
+  │  ──────  ────  ───────────────────────  ───────────────────────────────  │
+  │    0      8    name_hash                XXH3-64 of entry name; the       │
+  │                                         table is sorted ascending by     │
+  │                                         this field                       │
+  │    8      8    name_offset              into NAME HEAP                   │
+  │   16      2    name_len                 bytes                            │
+  │   18      1    provider_type            0=STORE 1=DEFLATE 2=DEFLATE_VMM  │
+  │                                         3=ZSTD 255=UNSUPPORTED           │
+  │   19      1    entry_flags              bit0 store_promoted              │
+  │                                         bit1 zstd_non_seekable           │
+  │   20      2    method_code              raw ZIP compression method       │
+  │   22      2    reserved                 0x0000                           │
+  │   24      8    local_header_offset                                       │
+  │   32      8    data_offset              first byte of compressed data    │
+  │   40      8    compressed_size                                           │
+  │   48      8    uncompressed_size        the entry's logical_size as of   │
+  │                                         the last commit                  │
+  │   56      8    chunk_head_offset        first CHECKPOINT CHUNK for this  │
+  │                                         entry; 0 = none generated yet    │
+  │   64      8    checkpoint_count         total across the chunk chain     │
+  │   72      8    commit_count_for_entry   STORE-promotion trigger input;   │
+  │                                         survives across sessions         │
+  │   80      8    reserved2                0                                │
+  │   88      4    record_crc32             CRC-32C of bytes [0 .. 87]       │
+  │   92      4    padding                  0x00000000                       │
+  │                                                                          │
+  │  Total: 96 bytes                                                         │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Lookup procedure for read(path, ...):
+
+    1. h = XXH3-64(path)
+    2. Binary search the mmap'd entry table for h.   O(log entry_count),
+       no allocation, no deserialisation.
+    3. On hash match, compare the actual name via (name_offset, name_len)
+       in the NAME HEAP.  On collision (different name, same hash), scan
+       adjacent records with equal name_hash; equal-hash runs are sorted
+       by name bytes.
+    4. Follow chunk_head_offset for checkpoint data (Section 5).
+
+  The NAME HEAP is the concatenation of all entry names in entry-table
+  order, UTF-8, with no separators and no NUL bytes (lengths live in the
+  records).  It is covered by no CRC of its own; a name mismatch against
+  the Central Directory at validation time triggers a rebuild like any
+  other inconsistency.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 4 : Advisory Region
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The advisory region holds tuning state whose loss changes performance,
+  never correctness.  It is updated IN PLACE (at close(), and opportun-
+  istically during a session), carries no CRC, and is sanity-clamped at
+  load: implausible values are reset to zero rather than trusted.
+
+  Layout:
+
+    [ miss_count        : entry_count × uint64 ]   Page Cache miss count
+                                                   per entry, parallel to
+                                                   the entry table.  Input
+                                                   to hot-entry detection
+                                                   for adaptive
+                                                   checkpointing.
+    [ block_state_count : uint64               ]
+    [ block_state       : count × 24 bytes     ]   sparse VMM-native block
+                                                   tracking, format below
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  BLOCK STATE RECORD  ( 24 bytes; present only for blocks with history )  │
+  │                                                                          │
+  │   0      8    entry_index            index into entry table              │
+  │   8      8    block_index            within the entry                    │
+  │  16      1    state_flags            bit0 OVERFLOW  bit1 SHRINK_CANDIDATE│
+  │  17      1    overflow_count         overflow events in recent commits   │
+  │  18      1    shrink_streak          consecutive commits below 60%       │
+  │  19      5    reserved               0                                   │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  These records carry the inputs to the VMM-native DEFLATE overflow
+  headroom and capacity shrinkage policies (main architecture document,
+  VMM-NATIVE DEFLATE).  Losing them delays a capacity adjustment by a
+  few commits; it cannot corrupt anything.  Keeping them out of the
+  checkpoint records preserves the fixed 24-byte DEFLATE_VMM checkpoint
+  size quoted throughout the main document.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 5 : Checkpoint Chunks
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Checkpoints for an entry are stored in one or more CHECKPOINT CHUNKs
+  forming a singly linked chain.  EAGER and AOT builds produce exactly
+  one chunk per entry; LAZY, BACKGROUND, and adaptive re-indexing append
+  further chunks during a session.  A structural rewrite (Section 6)
+  consolidates each chain back to a single chunk.
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  CHECKPOINT CHUNK  ( variable length )                                   │
+  │                                                                          │
+  │  offset  size  field                  notes                              │
+  │  ──────  ────  ─────────────────────  ─────────────────────────────────  │
+  │   0      4     chunk_magic            0xCC401D01                         │
+  │   4      8     entry_index            index into entry table             │
+  │  12      1     provider_type          must match the entry record        │
+  │  13      3     reserved               0                                  │
+  │  16      8     checkpoint_count       C, records in this chunk           │
+  │  24      8     next_chunk_offset      0 = end of chain                   │
+  │  32      V     checkpoints            C records, format per provider     │
+  │  32+V    4     chunk_crc32            CRC-32C of bytes [0 .. 31+V]      │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Within a chunk, checkpoints are sorted by uncompressed_offset.  Across
+  a chain, ranges may interleave (adaptive re-indexing densifies an
+  already-covered range); the reader performs a binary search per chunk
+  and takes the nearest checkpoint ≤ target across all chunks.  Chains
+  are short in practice — EAGER: 1; LAZY: one per first-touched region
+  batch; consolidation restores 1.
+
+  Checkpoint record formats by provider:
+
+    STORE         no checkpoints; chunk_head_offset = 0 permanently.
+                  data_offset arithmetic serves all reads.
+
+    DEFLATE       ( standard third-party streams )
+      compressed_offset    : uint64
+      uncompressed_offset  : uint64
+      window               : 32 768 bytes   ( sliding window snapshot )
+        → 32 784 bytes per checkpoint.
+      When header flag WINDOWS_COMPRESSED is set, the window field is
+      replaced by ( window_len : uint32, zlib_data : window_len bytes ),
+      making the record variable-length; records remain individually
+      addressable via a per-chunk offset array prepended to the payload:
+        offsets : C × uint32   ( byte offset of each record within V )
+      The offset array exists only in WINDOWS_COMPRESSED chunks.
+
+    DEFLATE_VMM   ( VMM-native blocks )
+      compressed_offset    : uint64   ( block start )
+      uncompressed_offset  : uint64   ( first byte the block decodes to )
+      capacity             : uint64   ( allocated slot size )
+        → 24 bytes per checkpoint; one checkpoint per block; the chain
+          doubles as the block map used by the in-place commit path.
+
+    ZSTD          ( seekable frames )
+      frame_offset         : uint64
+      uncompressed_offset  : uint64
+        → 16 bytes per checkpoint; one per frame.
+
+  Sizing consequences of these record widths — index footprint per
+  archive volume, interval trade-offs — are tabulated in the main
+  architecture document, SEEK INDEX SIZING, and are not repeated here.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 6 : Update Protocol
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Three update classes, in increasing weight:
+
+  6.1  Advisory update  ( in place )
+
+    miss_count and block_state writes go directly into the mmap'd
+    advisory region (remapped PROT_WRITE for the write, or via pwrite).
+    No ordering, no CRC, no sync.  Performed at close() and at most
+    once per N misses during a session.
+
+  6.2  Incremental append  ( LAZY / BACKGROUND / adaptive )
+
+    a. Append the new CHECKPOINT CHUNK at EOF, fully, including its CRC.
+    b. Link it: overwrite either the entry record's chunk_head_offset
+       (first chunk) or the chain tail's next_chunk_offset, then rewrite
+       the 4-byte CRC of the modified structure.
+
+    Link-after-write ordering means a crash between (a) and (b) leaves
+    an unreachable chunk at EOF: dead bytes, reclaimed at the next
+    consolidation, never wrong data.  A crash inside (b) leaves a CRC
+    mismatch on one record; validation answers with a rebuild.
+    No fdatasync() is issued at any point: vmidx durability is worth
+    nothing (a lost update means a lazy re-derivation later).
+
+  6.3  Structural rewrite  ( commit completion, consolidation, rebuild )
+
+    Used when the entry set changed (create / remove / rename), when
+    entry offsets moved (any commit), or when chunk chains are worth
+    consolidating.
+
+    a. Write the complete new index to archive.zip.vmm/vmidx.tmp.
+    b. rename( vmidx.tmp → vmidx ).
+    c. No fsync in the default profile (cache semantics).  AOT builds
+       (Section 8) fdatasync() before rename, because a distributed
+       index is expected to survive the producing machine's crash.
+
+    A vmidx.tmp found at open() with no active mount is an orphan and
+    is removed silently.
+
+    After commit(), the rewrite also refreshes the header fingerprint
+    (Section 2) — mandatory after a FULL commit, which changes the
+    archive's inode.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 7 : Validation and Rebuild Policy
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  At open(), in order:
+
+    1. File present and ≥ 128 bytes; magic and format_version accepted.
+    2. header_crc32 valid.
+    3. Fingerprint cascade against archive.zip (Diff Layer spec):
+       size + inode + mtime fast check, cd_hash decides.
+    4. Region bounds sane: entry_table, name_heap, advisory all within
+       the file; entry_count × 96 consistent with region size.
+    5. Entry record CRCs validated lazily, on first touch of each
+       record; chunk CRCs validated on first traversal of each chunk.
+
+  ANY failure at ANY step has the same answer: discard vmidx and
+  rebuild under the active index strategy (EAGER walks now; LAZY and
+  BACKGROUND return immediately and regenerate on demand).  There is no
+  partial-trust mode and no repair mode; the rebuild IS the repair.
+  A diagnostic is logged with the failing step.
+
+  The only validation failure that is surfaced to the caller rather
+  than self-healed is the fingerprint CONFLICT case where a vmdirty
+  journal also exists — that is a data-safety decision and follows the
+  CONFLICT protocol in the Diff Layer specification, because the
+  question there is about the journal, never about vmidx itself.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 8 : AOT Generation and Distribution
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  A build pipeline can pre-generate vmidx and ship it next to the
+  archive ( --index-strategy=eager at build time, then distribute the
+  sidecar directory or the vmidx file alone ).
+
+  Requirements on the producer:
+
+    - The fingerprint must be computed against the exact distributed
+      archive bytes.  Any post-indexing touch-up of the archive
+      invalidates the index ( consumers will silently rebuild — correct
+      but wasteful at fleet scale ).
+    - fdatasync() before publishing (Section 6.3).
+    - Prefer Zstandard or VMM-native DEFLATE for the archive itself;
+      a standard-DEFLATE index at 1 MB intervals is ~3 GB per 100 GB
+      of archive and dominates the distribution cost
+      ( see SEEK INDEX SIZING ).
+
+  On the consumer, an AOT index is indistinguishable from a locally
+  built one: same validation, same rebuild-on-mismatch behaviour.
+  source_inode and source_mtime_ns will not match on the consumer's
+  filesystem; the fingerprint cascade therefore treats a size + cd_hash
+  match as valid and rewrites the header's inode and mtime fields to
+  the local values on first successful open (an advisory-weight,
+  in-place header refresh plus CRC rewrite).

@@ -12,7 +12,8 @@ docs/   設計仕様書 (ASCII アーキテクチャ図含む)
   ZIP_Virtual_Memory_Manager_Concurrent_Access.txt                … 並行アクセス仕様
   ZIP_Virtual_Memory_Manager_Diff_Layer_Pressure_Integrity_Detection.txt
                                                                   … Diff Layer / Pressure / 整合性検出仕様
-  ZIP_Virtual_Memory_Manager_vmdirty_Journal_Spec.txt             … .vmdirty ジャーナル仕様
+  ZIP_Virtual_Memory_Manager_vmdirty_Journal_Spec.txt             … vmdirty ジャーナル仕様
+  ZIP_Virtual_Memory_Manager_vmidx_Index_Spec.txt                 … vmidx シークインデックス仕様
 notes/  レビューメモ・検討メモ
 ```
 

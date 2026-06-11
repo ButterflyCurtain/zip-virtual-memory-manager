@@ -196,11 +196,18 @@
        ├─[1] FAST CHECK  — O(1)
        │       Compare: file_size  AND  inode
        │       Match   → proceed to step 2
-       │       Mismatch→ ──────────────────────────────────────→ INVALIDATE
+       │       Mismatch→ proceed to step 2; step 2 alone decides.
+       │                 ( inode mismatch alone is not proof of different
+       │                   content: inode recycling, restored backups, and
+       │                   AOT-distributed indexes all present a different
+       │                   inode over identical bytes )
        │
        ├─[2] MEDIUM CHECK  — O(cd_size), typically < 1 ms
        │       Compare: cd_hash  ( Central Directory only )
        │       Match   → index valid, mount immediately  ✓
+       │                 If step 1 mismatched, refresh the stored
+       │                 file_size / inode / mtime_ns fields to the
+       │                 local values ( in-place header update ).
        │       Mismatch→ ──────────────────────────────────────→ INVALIDATE
        │
        └─[3]  mtime_ns is recorded in the vmidx header.  It is not used
