@@ -1,7 +1,15 @@
-# ZIP Virtual Memory Manager — Design Documentation
+# ZIP Virtual Memory Manager — Design Documents
 
-This repository manages the design documentation for the "ZIP Virtual Memory Manager," which treats ZIP archives as a backing store for virtual memory.
-Currently, only the design exists; no implementation code is present yet.
+**English** | [日本語](#japanese)
+
+Design documents for a "ZIP Virtual Memory Manager": treating a ZIP archive
+as a backing store for virtual memory, with random read/write access into
+compressed entries, copy-on-write buffering, and crash-safe commits.
+
+Everything here is design — there is no implementation, and whether one
+happens is still undecided (other personal work has my attention right now).
+These are old notes I reworked during breaks, and they seemed worth keeping
+somewhere proper. If they're useful as a reference, feel free.
 
 ## Structure
 
@@ -18,16 +26,24 @@ notes/  Review notes and discussion memos
 
 ## Credits
 
-Design review and documentation preparation assisted by AI.
+Design review and documentation cleanup were AI-assisted.
 Design decisions are by @ButterflyCurtain.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+---
+
+<a id="japanese"></a>
 
 # ZIP Virtual Memory Manager — 設計ドキュメント
 
 ZIP アーカイブを仮想メモリのバッキングストアとして扱う
-「ZIP Virtual Memory Manager」の設計ドキュメントを管理するリポジトリです。
-現時点では設計のみで、実装コードはまだありません。
+「ZIP Virtual Memory Manager」の設計ドキュメントです。
+圧縮されたエントリへのランダム読み書き、copy-on-write のバッファリング、
+クラッシュセーフな commit あたりを扱っています。
+
+今のところ設計だけで、実装コードはありません。実装するかどうかも未定です
+(別の個人的な作業のほうに集中しているので)。昔書いたメモを休憩の合間に
+手直ししたものを、せっかくなので置いておくことにしました。
+参考になりそうなら自由にどうぞ。
 
 ## 構成
 
@@ -45,4 +61,4 @@ notes/  レビューメモ・検討メモ
 ## 制作について
 
 設計レビューと文書整備に AI支援を利用。
-設計判断は @ButterflyCurtain によるもの。
+設計判断は @ButterflyCurtain によるものです。
