@@ -10,7 +10,11 @@
   files stored inside a ZIP archive without full decompression.  Writes are
   buffered in a copy-on-write diff layer and flushed to disk only on an
   explicit commit().  The source ZIP remains a valid, untouched standard ZIP
-  at all times until commit() completes.
+  at all times until commit() completes.  Commit paths that write inside the
+  existing archive file (freelist hole reuse, VMM-native in-place, STORE
+  in-place) do so only on byte ranges that are either unreferenced by the
+  live Central Directory or fully recoverable from the .vmdirty journal;
+  see CRASH SAFETY OF IN-PLACE COMMIT.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -243,6 +247,10 @@
        │           Crash after  new EOCD : new ZIP is complete and valid
        │
        ├─ [VMM-native DEFLATE in-place path]  ( VMM-generated archives only )
+       │       Block completion journaling ( prerequisite for any overwrite ):
+       │           spill the CLEAN pages of every dirty block to .vmdirty
+       │           write COMMIT MARKER → fdatasync()
+       │           ( see CRASH SAFETY OF IN-PLACE COMMIT )
        │       For each modified entry with VMM-native DEFLATE encoding:
        │           identify dirty blocks via vmidx block map
        │           recompress each dirty block in isolation
@@ -427,9 +435,18 @@
 
     The freelist is built in-memory at open() from the Central Directory.
 
-    1. Collect all allocated regions: for each entry, the region is
-         [ local_header_offset, local_header_offset + sizeof(LFH)
-           + filename_len + extra_len + compressed_size )
+    1. Collect all allocated regions:
+         - for each entry, the region
+             [ local_header_offset, local_header_offset + sizeof(LFH)
+               + filename_len + extra_len + compressed_size )
+         - the live Central Directory region  [ cd_offset, cd_offset + cd_size )
+         - the live End of Central Directory record, and, when present,
+           the ZIP64 EOCD record and ZIP64 EOCD locator
+       The live CD and EOCD regions are allocated regions: writing into
+       them would corrupt the authoritative archive state.  CD and EOCD
+       regions left behind by PRIOR incremental commits are referenced by
+       nothing reachable from the current EOCD; they are correctly
+       classified as holes and may be reused.
     2. Sort regions by start offset.
     3. Identify gaps between adjacent regions.  A gap is a free hole:
          hole.offset = prior_region.end
@@ -486,6 +503,67 @@
     freelist state.  In-place writes that exactly fill a hole do not
     increase bloat_bytes.  Partial fills increase bloat_bytes by the
     remainder.  The compaction threshold evaluation is unchanged.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CRASH SAFETY OF IN-PLACE COMMIT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Three commit paths write inside the existing archive file rather than
+  appending to it or building a separate file:
+
+    (1) INCREMENTAL hole reuse        writes into Dead Space Freelist holes
+    (2) VMM-native DEFLATE in-place   overwrites dirty blocks at their offsets
+    (3) STORE in-place                overwrites dirty pages of STORE entries
+
+  Each path must preserve the invariant that a crash at any byte of the
+  write leaves the archive recoverable to the pre-commit logical state
+  plus the journaled dirty pages.  The three paths achieve this through
+  different mechanisms.
+
+  (1) Hole reuse is safe by construction.
+
+      A hole is a byte range referenced by no entry in the live Central
+      Directory and outside the live CD/EOCD region (see DEAD SPACE
+      FREELIST, freelist construction).  Overwriting it cannot alter any
+      data reachable through the authoritative EOCD.  A crash before the
+      new EOCD is durable leaves the original archive bit-identical in
+      every referenced range.
+
+  (2) VMM-native in-place requires block completion journaling.
+
+      Overwriting a block destroys its prior compressed bytes.  The
+      .vmdirty journal contains the dirty pages of that block, but not
+      its clean pages — before the overwrite, those exist only inside
+      the block being destroyed.  Without additional journaling, a torn
+      overwrite would lose the clean pages permanently.
+
+      Therefore, before the first in-place overwrite of a commit:
+
+        a. For every block selected for in-place overwrite, read the
+           block's clean pages from the source archive and append them
+           to .vmdirty as ordinary DATA RECORDs.
+        b. Write a COMMIT MARKER.
+        c. fdatasync( .vmdirty ).
+
+      After this barrier, every page of every block that will be
+      overwritten is durable in .vmdirty.  A crash during any subsequent
+      overwrite is handled by the standard recovery protocol at next
+      open(): recovery restores all pages of the affected blocks, and
+      the following commit rewrites those blocks in full.  The journal
+      cost is bounded by block_size per dirty block.
+
+      .vmdirty deletion (the final step of commit) must not occur until
+      all in-place writes have been fdatasync()ed.
+
+  (3) STORE in-place is safe with page-exact writes.
+
+      The overwritten byte ranges correspond exactly to the dirty pages
+      already journaled in .vmdirty.  No before-image is needed: after a
+      torn write, recovery re-applies the same pages over the same
+      ranges, yielding the committed content.  Implementations must
+      write only the dirty page ranges, never a surrounding aligned
+      region that would cover clean bytes.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1124,6 +1202,12 @@
 
     1. Identify all blocks that contain at least one dirty page, using the
        vmidx block map: (block_index → compressed_offset, capacity).
+
+    1b. Block completion journaling: for every block identified in step 1,
+        append its CLEAN pages (read from the source archive) to .vmdirty
+        as DATA RECORDs, write a COMMIT MARKER, and fdatasync().
+        No in-place overwrite may begin before this barrier completes.
+        Rationale and crash argument: see CRASH SAFETY OF IN-PLACE COMMIT.
 
     2. For each dirty block:
          a. Recompress all pages in the block using Z_FULL_FLUSH.
