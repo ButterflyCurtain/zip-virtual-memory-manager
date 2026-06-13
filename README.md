@@ -21,6 +21,7 @@ docs/   Design specifications (with ASCII architecture diagrams)
                                                                   … Diff Layer / Pressure / Integrity detection specification
   ZIP_Virtual_Memory_Manager_vmdirty_Journal_Spec.txt             … vmdirty journal specification
   ZIP_Virtual_Memory_Manager_vmidx_Index_Spec.txt                 … vmidx seek index specification
+  IMPLEMENTATION_NOTES.md                                         … a few implementation notes
 notes/  Review notes and discussion memos
 ```
 
@@ -40,9 +41,8 @@ ZIP アーカイブを仮想メモリのバッキングストアとして扱う
 圧縮されたエントリへのランダム読み書き、copy-on-write のバッファリング、
 クラッシュセーフな commit あたりを扱っています。
 
-今のところ設計だけで、実装コードはありません。実装するかどうかも未定です
-(別の個人的な作業のほうに集中しているので)。昔書いたメモを休憩の合間に
-手直ししたものを、せっかくなので置いておくことにしました。
+今のところ設計だけで、実装コードはありません。実装するかどうかも未定です。
+昔書いたメモを休憩の合間に手直ししたものを、せっかくなので置いておくことにしました。
 参考になりそうなら自由にどうぞ。
 
 ## 構成
@@ -55,6 +55,7 @@ docs/   設計仕様書 (ASCII アーキテクチャ図含む)
                                                                   … Diff Layer / Pressure / 整合性検出仕様
   ZIP_Virtual_Memory_Manager_vmdirty_Journal_Spec.txt             … vmdirty ジャーナル仕様
   ZIP_Virtual_Memory_Manager_vmidx_Index_Spec.txt                 … vmidx シークインデックス仕様
+  IMPLEMENTATION_NOTES.md                                         … ちょっとした実装メモ
 notes/  レビューメモ・検討メモ
 ```
 
