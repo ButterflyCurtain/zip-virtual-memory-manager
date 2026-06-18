@@ -26,8 +26,14 @@ docs/   Design specifications (with ASCII architecture diagrams)
 
 ## Credits
 
-Design review and documentation cleanup were AI-assisted.
+AI-assisted (design review, documentation, and discussion).
 Design decisions are by @ButterflyCurtain.
+
+## License
+
+These design documents are licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) — you may share and
+adapt them, including commercially, with attribution. See [LICENSE](LICENSE).
 
 ---
 
@@ -59,5 +65,12 @@ docs/   設計仕様書 (ASCII アーキテクチャ図含む)
 
 ## 制作について
 
-設計レビューと文書整備に AI支援を利用。
+AI 支援を利用（設計レビュー・文書整備・議論）。
 設計判断は @ButterflyCurtain によるものです。
+
+## ライセンス
+
+これらの設計ドキュメントは
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) の下で公開しています。
+クレジット表示を条件に、商用を含め自由に複製・改変できます。詳細は
+[LICENSE](LICENSE) を参照してください。
