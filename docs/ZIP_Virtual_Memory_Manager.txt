@@ -100,6 +100,7 @@
 │   Each checkpoint stores:                                                    │
 │     - compressed_offset   : byte position in the DEFLATE stream              │
 │     - uncompressed_offset : corresponding byte in expanded output            │
+│     - bits                : leftover bits (0-7) for inflatePrime             │
 │     - decoder_state       : DEFLATE sliding window snapshot (32 KB)          │
 │                             [ omitted for VMM-native DEFLATE and Zstandard ] │
 │                                                                              │
@@ -878,11 +879,19 @@
     Standard DEFLATE as produced by third-party tools.  Checkpoints are
     recorded every 1 MB of uncompressed output.  Each checkpoint contains:
 
-        compressed_offset    : uint64  position in DEFLATE stream
+        compressed_offset    : uint64  byte just past the restart bit boundary
         uncompressed_offset  : uint64  corresponding decompressed byte
+        bits                 : uint8   0-7 leftover bits at the restart point
         decoder_state        : 32 768 bytes  ( DEFLATE sliding window )
 
-    Total checkpoint size: 32 784 bytes.
+    Total checkpoint size: 32 785 bytes.
+
+    DEFLATE blocks do not align to byte boundaries, so a restart point carries
+    a leftover-bit count alongside the byte offset.  Restore primes the decoder
+    with the low `bits` bits of the byte at compressed_offset - 1
+    ( inflatePrime ), then loads the 32 KB window — the preceding uncompressed
+    output — as the dictionary ( inflateSetDictionary ); this is the zlib zran
+    procedure.
 
   DEFLATE — VMM-native variant  ( method 8, provenance flag set )
 
@@ -948,7 +957,7 @@
 
     vmidx footprint comparison at equivalent checkpoint density:
 
-        Standard DEFLATE   :  32 784 bytes / checkpoint
+        Standard DEFLATE   :  32 785 bytes / checkpoint
         VMM-native DEFLATE :      24 bytes / checkpoint
         Zstandard          :      16 bytes / checkpoint
 
@@ -1004,14 +1013,14 @@
 
   Checkpoint size by provider:
 
-    ┌──────────────────────────────────────────────────────────────────────┐
-    │  Provider              Checkpoint size  Components                   │
-    │  ──────────────────    ───────────────  ────────────────────────     │
-    │  STORE                 0 bytes          (direct arithmetic; no CPs)  │
-    │  Standard DEFLATE      32 784 bytes     offsets(16) + window(32768)  │
-    │  VMM-native DEFLATE        24 bytes     offsets(16) + capacity(8)    │
-    │  Zstandard                 16 bytes     offsets(16)                  │
-    └──────────────────────────────────────────────────────────────────────┘
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │  Provider            Checkpoint size Components                              │
+    │  ──────────────────  ─────────────── ─────────────────────────────────────   │
+    │  STORE               0 bytes         (direct arithmetic; no checkpoints)     │
+    │  Standard DEFLATE    32 785 bytes    offsets(16) + bits(1) + window(32768)   │
+    │  VMM-native DEFLATE  24 bytes        offsets(16) + capacity(8)               │
+    │  Zstandard           16 bytes        offsets(16)                             │
+    └──────────────────────────────────────────────────────────────────────────────┘
 
   vmidx size formula:
 
@@ -1165,7 +1174,7 @@
                               / adaptive_interval − base checkpoints) × cp_size
 
       For standard DEFLATE at 4× density increase on 10 hot entries of
-      1 GB each: additional ~10 × (1024 − 256) × 32 784 ≈ 240 MB.
+      1 GB each: additional ~10 × (1024 − 256) × 32 785 ≈ 240 MB.
 
       For VMM-native DEFLATE or Zstandard the per-checkpoint overhead is
       negligible regardless of density.

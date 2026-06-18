@@ -243,10 +243,18 @@
                   data_offset arithmetic serves all reads.
 
     DEFLATE       ( standard third-party streams )
-      compressed_offset    : uint64
+      compressed_offset    : uint64  ( byte just past the restart bit boundary )
       uncompressed_offset  : uint64
+      bits                 : uint8   ( 0-7 leftover bits of the preceding byte
+                                       that belong to the next symbol )
       window               : 32 768 bytes   ( sliding window snapshot )
-        → 32 784 bytes per checkpoint.
+        → 32 785 bytes per checkpoint.
+      DEFLATE blocks are not byte-aligned, so a restart point is a byte offset
+      plus a leftover-bit count: the decoder is primed with the low `bits` bits
+      of the byte at compressed_offset - 1 ( inflatePrime ), then the 32 KB
+      window — the preceding *uncompressed* output, not compressed bytes — is
+      loaded as the inflate dictionary ( inflateSetDictionary ).  This is the
+      zlib zran restart procedure.
       When header flag WINDOWS_COMPRESSED is set, the window field is
       replaced by ( window_len : uint32, zlib_data : window_len bytes ),
       making the record variable-length; records remain individually
