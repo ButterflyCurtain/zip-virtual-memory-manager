@@ -22,7 +22,6 @@ docs/   Design specifications (with ASCII architecture diagrams)
   ZIP_Virtual_Memory_Manager_vmdirty_Journal_Spec.txt             … vmdirty journal specification
   ZIP_Virtual_Memory_Manager_vmidx_Index_Spec.txt                 … vmidx seek index specification
   IMPLEMENTATION_NOTES.md                                         … a few implementation notes
-notes/  Review notes and discussion memos
 ```
 
 ## Credits
@@ -56,7 +55,6 @@ docs/   設計仕様書 (ASCII アーキテクチャ図含む)
   ZIP_Virtual_Memory_Manager_vmdirty_Journal_Spec.txt             … vmdirty ジャーナル仕様
   ZIP_Virtual_Memory_Manager_vmidx_Index_Spec.txt                 … vmidx シークインデックス仕様
   IMPLEMENTATION_NOTES.md                                         … ちょっとした実装メモ
-notes/  レビューメモ・検討メモ
 ```
 
 ## 制作について
