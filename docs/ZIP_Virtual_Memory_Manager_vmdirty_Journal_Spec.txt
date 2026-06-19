@@ -402,8 +402,12 @@
   SECTION 3 : Recovery Protocol — Caller API and Decision Tree
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  The VMM surfaces a RecoveryResult to the caller.  Data-safety decisions
-  remain with the caller; the VMM does not auto-resolve.
+  The VMM surfaces a RecoveryResult to the caller.  The VMM auto-resolves
+  only the two unambiguous branches: a stale empty journal is silently
+  discarded, and a clean commit boundary ( last_commit_seq > 0 with no
+  uncommitted records ) is recovered via recover_committed().  For every
+  branch that could lose data, the VMM does not auto-resolve; the
+  data-safety decision remains with the caller.
 
   ┌──────────────────────────────────────────────────────────────────────────┐
   │  RecoveryResult fields                                                   │
