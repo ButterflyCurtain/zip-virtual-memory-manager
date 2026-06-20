@@ -647,14 +647,44 @@
       vmdirty deletion (the final step of commit) must not occur until
       all in-place writes have been fdatasync()ed.
 
-  (3) STORE in-place is safe with page-exact writes.
+  (3) STORE in-place is safe with page-exact writes plus a CRC barrier.
 
-      The overwritten byte ranges correspond exactly to the dirty pages
-      already journaled in vmdirty.  No before-image is needed: after a
-      torn write, recovery re-applies the same pages over the same
-      ranges, yielding the committed content.  Implementations must
-      write only the dirty page ranges, never a surrounding aligned
-      region that would cover clean bytes.
+      The overwritten data byte ranges correspond exactly to the dirty
+      pages already journaled in vmdirty.  No before-image is needed for
+      those ranges: after a torn write, recovery re-applies the same
+      pages over the same ranges, yielding the committed content.
+      Implementations must write only the dirty page ranges, never a
+      surrounding aligned region that would cover clean bytes.
+
+      The CD entry crc32 field and matching LFH crc32 field (4 bytes
+      each) are updated to reflect the new uncompressed content (the
+      entry CRC is reachable from the journalled pages plus the clean
+      pages in the source archive; see VMM-NATIVE DEFLATE — CRC-32
+      maintenance for the same composition pattern).  These point-writes
+      fall outside the dirty page ranges, so they require the same
+      barrier discipline as the VMM-native path:
+
+        a. Every dirty page of every modified STORE entry must be durable
+           in vmdirty with a COMMIT MARKER and fdatasync() before any
+           data overwrite or CRC point-write begins.  This is the same
+           barrier as flush() in STRICT mode and is already issued as
+           commit()'s first step.
+        b. The data page overwrites and the CRC point-writes must be
+           followed by fdatasync() before vmdirty is deleted.
+
+      A crash anywhere between (a) and (b) leaves recovery with
+      complete dirty pages in vmdirty and a CRC field that is either
+      pre-commit (consistent with the source archive bytes) or
+      post-commit (consistent with the journalled bytes).  Replay at the
+      next open() recomputes the entry CRC from the journalled pages and
+      re-issues the data and CRC point-writes idempotently.  Third-party
+      extractors that observe the archive between the data overwrite and
+      the CRC point-write may report a CRC mismatch; that window is
+      bounded by the two fdatasync() calls in (a) and (b) and resolves
+      itself on recovery.  For STORE entries with many small dirty pages,
+      caching a per-page CRC-32 in vmidx (by analogy to per-block CRC)
+      reduces (b)'s CPU cost; the cache is optional and does not change
+      the safety argument.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1352,10 +1382,59 @@
       the CRC point-write leaves the archive temporarily inconsistent for
       third parties but recoverable from vmdirty without information loss.
 
+  Applicability of the in-place path:
+
+    The in-place commit procedure assumes that every dirty entry retains
+    its existing block structure: same block_count, same per-block
+    uncompressed_size, and therefore same entry uncompressed_size.  Only
+    the bytes inside an existing block change.  Under that assumption the
+    only on-disk mutations are: (a) the compressed bytes of each dirty
+    block within its capacity slot, and (b) the 4-byte crc32 field in CD
+    and LFH (CRC-32 maintenance, above).  CD and LFH fields encoding
+    compressed_size, uncompressed_size, and ZIP64 extra-field sizes
+    remain authoritative without rewrite.
+
+    Two operations break that assumption and disqualify the affected
+    entry from the in-place path:
+
+      Truncate (any shrink to a different logical_size):
+        Changes entry uncompressed_size; may shrink the last block's
+        uncompressed length and, if shrink crosses block boundaries,
+        orphan trailing blocks and require re-anchoring the DEFLATE
+        end-of-stream marker (BFINAL=1) onto the new last block.
+
+      Implicit extension (a write past current logical_size):
+        Creates new blocks for which the archive carries no allocated
+        capacity slot; physically uncommitable in place.
+
+    Either condition forces the entry onto the INCREMENTAL append path
+    for this commit.  The check is local: the in-place path inspects
+    logical_size against vmidx's recorded uncompressed_size before step 1
+    and, on mismatch, routes the entry through the INCREMENTAL fallback
+    used by overflow (step 2d).  Other entries in the same commit that
+    satisfy the assumption remain on the in-place path; the routing is
+    per entry, not per commit.
+
+    Rationale: keeping in-place strictly to same-size page edits keeps
+    its on-disk mutation surface small (the 4-byte CRC update is the
+    only CD/LFH bytes changed) and preserves the symmetry between
+    "block independence under Z_FULL_FLUSH" and "per-block CRC reuse".
+    The cases that change entry size are rare in workloads that motivate
+    in-place at all (mutable random-access edits of fixed-size records);
+    when they do occur, INCREMENTAL append handles them with no extra
+    machinery and the FULL compaction pass reclaims dead space at the
+    normal threshold.
+
   In-place commit procedure:
 
-    1. Identify all blocks that contain at least one dirty page, using the
-       vmidx block map: (block_index → compressed_offset, capacity).
+    1. For each modified entry, check Applicability (above):
+         logical_size unchanged from vmidx's recorded uncompressed_size
+         AND no write extended past the last block's uncompressed extent.
+       Entries that fail this check are routed to INCREMENTAL append
+       (same fallback as step 2d) and excluded from steps 1a–4 below.
+       For the remaining entries, identify all blocks that contain at
+       least one dirty page, using the vmidx block map: (block_index →
+       compressed_offset, capacity).
 
     1b. Block completion journaling: for every block identified in step 1,
         append its CLEAN pages (read from the source archive) to vmdirty
