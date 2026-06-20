@@ -340,9 +340,12 @@
        │           recompress each dirty block in isolation
        │           if recompressed_size ≤ block capacity:
        │               overwrite in-place; pad remainder to capacity
-       │               no CD update required; no append
+       │               update cached block_crc32 in vmidx
+       │               no CD structural update required; no append
        │           if recompressed_size > capacity (overflow):
        │               fall back to INCREMENTAL append for that entry
+       │       fdatasync()
+       │       point-write entry_crc to CD entry crc32 and LFH crc32
        │       fdatasync()
        │       ( See VMM-NATIVE DEFLATE section for full procedure )
        │
@@ -902,8 +905,12 @@
         compressed_offset    : uint64  byte position of block start
         uncompressed_offset  : uint64  first decompressed byte of block
         capacity             : uint64  allocated slot size in bytes
+        block_crc32          : uint32  ISO-HDLC CRC of the block's
+                                       uncompressed bytes (see
+                                       VMM-NATIVE DEFLATE — CRC-32
+                                       maintenance)
 
-    Total checkpoint size: 24 bytes.  No decoder_state field.
+    Total checkpoint size: 28 bytes.  No decoder_state field.
 
     Full specification of VMM-native DEFLATE encoding, in-place commit
     procedure, and capacity management: see VMM-NATIVE DEFLATE section.
@@ -958,12 +965,12 @@
     vmidx footprint comparison at equivalent checkpoint density:
 
         Standard DEFLATE   :  32 785 bytes / checkpoint
-        VMM-native DEFLATE :      24 bytes / checkpoint
+        VMM-native DEFLATE :      28 bytes / checkpoint
         Zstandard          :      16 bytes / checkpoint
 
       For a 100 GB entry at 1 MB intervals:
         Standard DEFLATE   :  ~3.0 GB of vmidx
-        VMM-native DEFLATE :  ~2.2 MB of vmidx
+        VMM-native DEFLATE :  ~2.7 MB of vmidx
         Zstandard          :  ~1.5 MB of vmidx
 
     Frame size configuration:
@@ -1018,7 +1025,7 @@
     │  ──────────────────  ─────────────── ─────────────────────────────────────   │
     │  STORE               0 bytes         (direct arithmetic; no checkpoints)     │
     │  Standard DEFLATE    32 785 bytes    offsets(16) + bits(1) + window(32768)   │
-    │  VMM-native DEFLATE  24 bytes        offsets(16) + capacity(8)               │
+    │  VMM-native DEFLATE  28 bytes        offsets(16) + capacity(8) + crc32(4)    │
     │  Zstandard           16 bytes        offsets(16)                             │
     └──────────────────────────────────────────────────────────────────────────────┘
 
@@ -1032,7 +1039,7 @@
     │  Archive           Provider        vmidx size (approx.)              │
     │  ───────────────   ─────────────   ────────────────────              │
     │  100 GB DEFLATE    Standard        ~3.0 GB                           │
-    │  100 GB DEFLATE    VMM-native      ~2.2 MB                           │
+    │  100 GB DEFLATE    VMM-native      ~2.7 MB                           │
     │  100 GB            Zstandard       ~1.5 MB                           │
     │   10 GB DEFLATE    Standard        ~300 MB                           │
     │    1 GB DEFLATE    Standard        ~30 MB                            │
@@ -1213,11 +1220,16 @@
     - No cross-block dictionary dependency.
     - Modified blocks are recompressed in complete isolation, covering only
       the pages within that block.
-    - Checkpoints contain (compressed_offset, uncompressed_offset, capacity)
-      only; no 32 KB decoder_state field.  Checkpoint size: 24 bytes.
+    - Checkpoints contain (compressed_offset, uncompressed_offset, capacity,
+      block_crc32) only; no 32 KB decoder_state field.  Checkpoint size:
+      28 bytes.  Per-block CRC enables O(1) entry-CRC recomputation across
+      a commit; see CRC-32 maintenance below.
     - In-place overwrite: if the recompressed block fits within its
       allocated capacity slot, it is written at the original byte offset.
-      No append to EOF.  No Central Directory update.  No rename.
+      No append to EOF.  No CD structural update: the CD entry is not
+      appended, relocated, or resized, and EOCD is not rewritten; only
+      the entry's 4-byte crc32 field is point-updated in the CD entry
+      and matching LFH (see CRC-32 maintenance).  No rename.
     - The on-disk encoding is standard DEFLATE and is readable by any
       third-party tool without modification.
 
@@ -1295,6 +1307,51 @@
     (BFINAL=1) after the last padding run, ensuring the entry validates as
     a complete, conformant DEFLATE stream.
 
+  CRC-32 maintenance:
+
+    Standard ZIP requires that the CD entry and the LFH for each entry
+    carry the CRC-32 (ISO-HDLC polynomial, distinct from the CRC-32C used
+    by vmidx and vmdirty) of the entry's uncompressed bytes.  Any in-place
+    overwrite that changes uncompressed content changes the entry CRC and
+    must propagate that change to the CD entry and LFH, or third-party
+    extractors will report CRC mismatch.
+
+    Per-block CRC cache:
+      Each VMM-native checkpoint records block_crc32 (4 bytes, ISO-HDLC)
+      covering the block's uncompressed bytes.  Block independence under
+      Z_FULL_FLUSH extends naturally to CRC: each block's CRC is a
+      function of that block's uncompressed bytes alone.
+
+    Entry CRC composition:
+      The entry CRC equals crc32_combine of the per-block CRCs in block
+      order, with each block's combine length set to its uncompressed
+      length.  crc32_combine is a closed-form GF(2) operation on (crc, len)
+      pairs (zlib provides crc32_combine() for this purpose); it requires
+      no access to uncompressed bytes of clean blocks.
+
+    Update rule on commit:
+      For each modified entry:
+        - For each dirty block recompressed in-place, recompute
+          block_crc32 from the block's post-commit uncompressed bytes
+          (already in hand because recompression just consumed them)
+          and stage the new value for the vmidx checkpoint update.
+        - For each clean block, reuse the cached block_crc32 with no I/O.
+        - Compose entry_crc = crc32_combine(block_crc32[0..n-1]).
+      The CD entry's crc32 field (CD entry offset 16, 4 bytes) and the
+      LFH's crc32 field (LFH offset 14, 4 bytes) are point-written with
+      entry_crc.  These are the only mutations to CD or LFH bytes; the
+      CD entry layout, entry order, sizes, offsets, and EOCD are unchanged.
+
+    Crash safety:
+      The block completion journaling barrier (in-place commit step 1b)
+      remains sufficient.  Recovery is idempotent: on crash at any point
+      after step 1b, the next open() replays the dirty pages through the
+      normal commit path, which recomputes block_crc32 from journalled
+      uncompressed content and re-issues the CD/LFH point-writes before
+      vmdirty is deleted.  A crash between the in-place block write and
+      the CRC point-write leaves the archive temporarily inconsistent for
+      third parties but recoverable from vmdirty without information loss.
+
   In-place commit procedure:
 
     1. Identify all blocks that contain at least one dirty page, using the
@@ -1312,7 +1369,10 @@
          c. If recompressed_size ≤ capacity[block]:
                 Write recompressed data at compressed_offset[block].
                 Pad remaining (capacity − recompressed_size) bytes.
-                No CD update.  No append.
+                Recompute block_crc32 for the block (see CRC-32
+                maintenance) and stage it for the vmidx update in
+                step 5.
+                No CD structural update.  No append.
          d. If recompressed_size > capacity[block]  ( overflow ):
                 Mark block as OVERFLOW in vmidx.
                 Fall back to INCREMENTAL append for the affected entry:
@@ -1326,10 +1386,21 @@
 
     3. fdatasync() after all in-place writes and any INCREMENTAL fallback.
 
-    4. Update vmidx: new capacity values for blocks that were recompressed
-       in-place; new entry offset for any entries that fell back.
+    4. For each entry that had at least one dirty block recompressed
+       in-place in step 2c, compose entry_crc by crc32_combine over its
+       per-block CRCs (dirty blocks staged in step 2c; clean blocks read
+       from the cached vmidx values).  Point-write entry_crc into the
+       CD entry's crc32 field (4 bytes at CD entry offset 16) and into
+       the LFH's crc32 field (4 bytes at LFH offset 14).  fdatasync().
 
-    No EOCD rewrite is needed unless step 2d triggered a CD update.
+    5. Update vmidx: new capacity values and new block_crc32 values for
+       blocks that were recompressed in-place; new entry offset for any
+       entries that fell back.
+
+    No CD structural rewrite, CD entry append, or EOCD rewrite is needed
+    unless step 2d triggered the INCREMENTAL fallback.  Step 4 modifies
+    only the 4-byte crc32 field within the existing CD entry and LFH;
+    all other CD and LFH bytes are unchanged.
 
   Overflow management:
 
@@ -1358,7 +1429,10 @@
     DEFLATE_VMM entries are distinguished from standard DEFLATE entries
     in the vmidx per-entry header by a provider_type field.  Checkpoint
     records for DEFLATE_VMM entries carry (compressed_offset,
-    uncompressed_offset, capacity); they carry no decoder_state bytes.
+    uncompressed_offset, capacity, block_crc32); they carry no
+    decoder_state bytes.  block_crc32 is the ISO-HDLC CRC of the block's
+    uncompressed bytes and is consumed by in-place commit step 4 (see
+    CRC-32 maintenance).
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1417,7 +1491,15 @@
       VMM-native in-place (same-size write):
           If the entry size is unchanged, write the new raw bytes directly
           at data_offset + page_offset × page_size.
-          No CD update.  Zero recompression and minimal I/O.
+          Recompute entry_crc over the entry's uncompressed bytes and
+          point-write it to the CD entry crc32 field and LFH crc32 field
+          (the same 4-byte point-writes as VMM-native DEFLATE in-place;
+          see CRC-32 maintenance).  For STORE entries the per-page CRC
+          may be cached in vmidx by analogy to the per-block cache, so
+          only dirty pages need to be re-CRC'd; the cache is optional
+          because STORE pages are already uncompressed and re-CRC'ing the
+          whole entry is I/O-bound rather than CPU-bound.
+          No CD structural update.  Zero recompression and minimal I/O.
 
   Tradeoffs:
 
@@ -1449,11 +1531,16 @@
   At open(), the VMM validates the fingerprint of archive.zip and mounts
   against a consistent view of the archive.  Under concurrent access via
   the advisory lock, an R/W mount holds LOCK_EX for its entire lifetime,
-  preventing external modification.  An R/O mount holds LOCK_SH, which
-  prevents another VMM mount from acquiring LOCK_EX but does not prevent
-  external processes that do not use the vmlock protocol from writing to
-  archive.zip.  On NFS or distributed storage, external modification can
-  also occur due to replication or cache staleness.
+  preventing other VMM mounts from modifying the archive.  An R/O mount
+  holds LOCK_SH, which prevents another VMM mount from acquiring LOCK_EX
+  but does not prevent external processes that do not use the vmlock
+  protocol from writing to archive.zip.  The LOCK_EX held by an R/W mount
+  has the same property: third-party tools (unzip, 7-Zip, cp, rsync) do
+  not consult the vmlock protocol and can write to archive.zip out-of-
+  band; such writes are detected by the ESTALE check on the read path
+  (see "Interaction with R/W mounts" below).  On NFS or distributed
+  storage, external modification can also occur due to replication or
+  cache staleness.
 
   ESTALE detection extends fingerprint validation to the runtime read path.
   On each Page Cache miss the VMM performs a lightweight check before
@@ -1959,8 +2046,11 @@
   archive.zip modified externally                    vmidx invalidated;
                                                      rebuilt on next open;
                                                      ESTALE returned on Page
-                                                     Cache miss during active
-                                                     mount (R/O only under lock)
+                                                     Cache miss during any
+                                                     active mount (R/W only
+                                                     sees writers that bypass
+                                                     vmlock; see SNAPSHOT
+                                                     CONSISTENCY)
   archive.zip contains STORE + DEFLATE entries       both accessible
   archive.zip contains unsupported compression       affected entries return
                                                      UNSUPPORTED_COMPRESSION;
@@ -1981,7 +2071,10 @@
   commit() VMM-native in-place path                  dirty blocks overwritten
                                                      at original byte offsets
                                                      when recompressed size ≤
-                                                     capacity; no CD update
+                                                     capacity; CD entry crc32
+                                                     and LFH crc32 point-
+                                                     written; no CD structural
+                                                     update; no EOCD rewrite
   commit() FULL path                                 archive.zip atomically
                                                      replaced via rename();
                                                      no dead data in result

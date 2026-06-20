@@ -201,7 +201,7 @@
   headroom and capacity shrinkage policies (main architecture document,
   VMM-NATIVE DEFLATE).  Losing them delays a capacity adjustment by a
   few commits; it cannot corrupt anything.  Keeping them out of the
-  checkpoint records preserves the fixed 24-byte DEFLATE_VMM checkpoint
+  checkpoint records preserves the fixed 28-byte DEFLATE_VMM checkpoint
   size quoted throughout the main document.
 
 
@@ -266,7 +266,17 @@
       compressed_offset    : uint64   ( block start )
       uncompressed_offset  : uint64   ( first byte the block decodes to )
       capacity             : uint64   ( allocated slot size )
-        → 24 bytes per checkpoint; one checkpoint per block; the chain
+      block_crc32          : uint32   ( ISO-HDLC CRC-32 of the block's
+                                        uncompressed bytes; consumed by
+                                        VMM-native in-place commit to
+                                        recompose the entry CRC without
+                                        re-reading clean blocks — see
+                                        main architecture document,
+                                        VMM-NATIVE DEFLATE — CRC-32
+                                        maintenance.  Distinct from the
+                                        CRC-32C used for vmidx structural
+                                        integrity. )
+        → 28 bytes per checkpoint; one checkpoint per block; the chain
           doubles as the block map used by the in-place commit path.
 
     ZSTD          ( seekable frames )
