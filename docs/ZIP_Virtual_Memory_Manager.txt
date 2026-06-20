@@ -310,6 +310,9 @@
   commit() called
        │
        ├─ flush() : spill all Tier 1 pages → write COMMIT MARKER → fdatasync()
+       │   ( STRICT, regardless of the mount-time --lazy-flush setting;
+       │     LAZY flush mode does not weaken the commit barrier — its
+       │     scope is independent flush() calls between commits. )
        │
        ├─ Select commit strategy  ( see COMMIT STRATEGY section ):
        │       bloat below thresholds  →  INCREMENTAL path
@@ -1810,6 +1813,18 @@
         an aborted commit is indistinguishable from a crash at the same
         byte (see COMMIT STRATEGY, crash safety).  vmdirty is retained;
         commit() may be retried after space is freed.
+
+    ENOSPC during VMM-native in-place commit (block completion
+    journaling barrier):
+        The pre-commit barrier (step 1b of the in-place commit
+        procedure) appends CLEAN pages of dirty blocks to vmdirty
+        before any archive overwrite.  Insufficient space surfaces here
+        rather than during overwrite, because in-place overwrites do
+        not extend the archive.  commit() fails with ENOSPC; vmdirty
+        is retained with whatever clean pages were spilled before the
+        failure; the COMMIT MARKER for the barrier is not written, so
+        recovery treats those pages as uncommitted; archive.zip is
+        unchanged.  Retry after space is freed.
 
   Class 3 — integrity faults
   ( fdatasync() failure, vmdirty write error, CRC mismatch on a

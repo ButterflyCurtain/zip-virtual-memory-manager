@@ -65,9 +65,44 @@
 
     bit 0   STRICT_FINGERPRINT    file was opened with --strict-fingerprint
     bit 1   SPILL_ONLY            mount was configured dirty_limit=0
-    bit 2   RECOVERY_PENDING      set when a prior session crashed mid-commit;
-                                  cleared when recovery completes
+    bit 2   RECOVERY_PENDING      diagnostic hint, not consulted by the
+                                  recovery decision tree.  See "RECOVERY_
+                                  PENDING protocol" below for the
+                                  recommended set/clear discipline.
     bits 3–15  reserved; must be 0
+
+  RECOVERY_PENDING protocol  ( recommended; informational )
+
+    The recovery decision tree in Section 3 is complete without this
+    bit: it classifies a found vmdirty solely by commit markers, valid
+    record extents, and source fingerprint match.  RECOVERY_PENDING
+    adds one diagnostic distinction — "the crash interrupted a commit"
+    vs. "the crash interrupted spill/journal activity outside a
+    commit" — useful for forensics and for triggering targeted orphan
+    cleanup ( archive.new.zip, archive.zip.vmm/vmdirty.compact ) on a
+    crash-during-commit recovery path.
+
+    Recommended discipline:
+      Set    : immediately before commit() makes any change that mutates
+               archive.zip or writes archive.new.zip; persist with a
+               single aligned 2-byte write at offset 10 of the file
+               header followed by fdatasync().
+      Clear  : after vmdirty deletion completes successfully; persist
+               by the same single aligned 2-byte write followed by
+               fdatasync().  ( Since vmdirty is about to be deleted,
+               the clear is in practice elided — the absence of the
+               file is the same signal. )
+
+    Implementations MAY omit the bit's maintenance.  In that case the
+    bit is permanently 0, recovery decisions are unaffected, and
+    crash-during-commit is recognised by other state ( orphan
+    archive.new.zip / vmdirty.compact, or the absence of a commit
+    marker covering the highest sequence_num ).
+
+    This is the only in-place mutation of the file header permitted
+    by I-3.  The 2-byte flag field is naturally aligned and updated by
+    a single write, so the mutation is atomic on all supported
+    platforms.  No other header byte is mutated after creation.
 
   GENERATION ID  ( 16 bytes )
 
@@ -460,7 +495,7 @@
                │
                ├─ fingerprint check: source ZIP changed while dirty pages exist?
                │       YES → CONFLICT state
-               │               offer: discard_dirty() | abort()
+               │               offer: discard() | abort()
                │       NO  → run read_vmdirty()
                │
                └─ RecoveryResult.status
@@ -762,7 +797,12 @@
 
     open(path, options)
         Acquires advisory lock on archive.zip.vmm/vmlock.
-        Runs fingerprint validation.
+        Runs fingerprint validation against archive.zip.
+        Loads or builds vmidx (per the configured index strategy) so
+            the entry table is available before any recovery replay.
+            Recovery replays METADATA RECORDs ( CREATE / REMOVE / RESIZE
+            / RENAME ) against the entry overlay, which is layered on
+            top of vmidx's entry table; vmidx must exist first.
         Runs VmdirtyReader if vmdirty is present.
         Routes to recovery decision tree.
         Exposes RecoveryResult to caller.
@@ -875,6 +915,20 @@
     vmidx is updated for modified entries only.
     vmdirty.bak.* files are retained for a configurable period
     (default: 24 hours, or deleted at next clean mount).
+
+  On close() without a preceding commit() (DIRTY close):
+    vmdirty is NOT deleted.  It remains on disk with whatever records
+    were written and whatever last_commit_seq was established by the
+    most recent flush(), if any.  The next open() finds vmdirty present
+    and runs the recovery protocol: a clean-flush DIRTY close presents
+    last_commit_seq > 0 with uncommitted_pages empty and is auto-resolved
+    via recover_committed(); a DIRTY close without flush() presents
+    last_commit_seq = 0 with uncommitted_pages non-empty and is offered
+    to the caller per Section 3 of this specification.
+
+  On close() from CLEAN state:
+    No vmdirty exists.  The mount releases its advisory lock and returns.
+    No sidecar mutation.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

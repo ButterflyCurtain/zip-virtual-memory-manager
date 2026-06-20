@@ -234,7 +234,11 @@
        ├─ vmdirty present?
        │       YES → surface CONFLICT to caller:
        │               source ZIP changed while dirty pages exist.
-       │               caller must resolve:  discard_dirty() | abort()
+       │               caller must resolve:  discard() | abort()
+       │               ( discard() is the RecoveryHandler option of the
+       │                 same name defined in vmdirty Journal Specification
+       │                 Section 3: delete vmdirty, lose all dirty pages,
+       │                 proceed with a CLEAN mount. )
        │               VMM does not auto-resolve.
        │       NO  → silently rebuild vmidx from scratch
        │
