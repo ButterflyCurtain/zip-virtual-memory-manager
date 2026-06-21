@@ -164,6 +164,74 @@
       by ESTALE checking on the next Page Cache miss (see main architecture
       document, SNAPSHOT CONSISTENCY section).
 
+  Lock scheduling and writer fairness:
+
+    The vmlock protocol relies on the underlying LockProvider for queue
+    ordering between waiting acquirers.  None of the supported providers
+    guarantee FIFO fairness between LOCK_EX and LOCK_SH waiters:
+
+      FlockLockProvider on Linux/macOS/FreeBSD:  flock(2) scheduling is
+        kernel-implementation-defined.  Linux's flock implementation does
+        not guarantee FIFO between LOCK_EX waiters and a steady stream of
+        LOCK_SH acquirers; an LOCK_EX waiter can be indefinitely deferred
+        if LOCK_SH holders overlap continuously (writer starvation).
+        macOS and FreeBSD have similar implementation-defined behaviour.
+
+      FcntlLockProvider on Linux/macOS/FreeBSD:  fcntl(F_SETLKW)
+        scheduling is also implementation-defined.  Linux's POSIX byte-
+        range lock implementation has historically favoured exclusive
+        waiters over arriving shared waiters once a writer is queued, but
+        this is not specified by POSIX and not portable.
+
+      LockFileEx on Windows:  Win32 file lock fairness is unspecified.
+        Microsoft documents neither FIFO ordering nor writer preference;
+        observed behaviour varies across Windows versions and lock-file
+        configurations.
+
+      ExternalLockProvider:  fairness is whatever the external coordination
+        service (ZooKeeper, etcd, Redis, etc.) guarantees.  The VMM imposes
+        no requirement and offers no portable fairness layer above it.
+
+    The VMM therefore does NOT guarantee that an LOCK_EX acquirer waiting
+    for a chain of LOCK_SH holders will eventually proceed.  In the worst
+    case, a long-running cohort of read-only mounts that keeps at least
+    one LOCK_SH held at all times can starve a queued writer indefinitely.
+
+    Mitigations available to the application:
+
+      --lock-nowait on the writer side
+          The writer polls with try_acquire_exclusive() at an application-
+          chosen interval, falls back to a UI signal ("archive busy, retry"),
+          or coordinates queue-flushing out of band.  Polling is fair only
+          to the extent the application's scheduler is fair.
+
+      Read-batch admission control at the application layer
+          When concurrent read-only mounts can be coordinated (single-host
+          deployments, hosted services), the application can throttle new
+          R/O opens once a queued R/W open is detected (for example, by
+          checking a sentinel sidecar file or a coordination service flag).
+          This converts the kernel's implementation-defined behaviour
+          into application-defined behaviour with predictable fairness.
+
+      ExternalLockProvider with a fair coordination service
+          ZooKeeper sequential ephemeral nodes, etcd lease queues, and
+          comparable services offer FIFO acquisition semantics.  Deploying
+          a fair external service is the only way to obtain a strict
+          fairness guarantee under the current vmlock protocol.
+
+      Discipline: keep LOCK_EX hold times bounded
+          The application-level mitigations in the previous "Mitigations"
+          block also reduce starvation pressure: bounded session length
+          limits the window during which a writer can be queued waiting
+          on shared holders.  This is not a fairness guarantee but it is
+          the cheapest way to keep practical starvation events rare.
+
+    A future fine-grained extension (Section 10) inherits this concern at
+    the shard level: per-shard fairness has the same provider dependence
+    as per-archive fairness.  Adding a global writer-preference policy
+    would require an application-layer coordination layer above the
+    LockProvider interface, which the current design does not specify.
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   SECTION 3 : Lock Acquisition and Release Protocol
@@ -515,6 +583,39 @@
   Applications that use exec() after fork() (the fork-exec idiom) incur
   no special VMM concern: exec() closes all file descriptors not marked
   O_CLOEXEC, and the VMM opens vmlock_fd with O_CLOEXEC set.
+
+  7.6  Windows: no fork() boundary
+
+  Win32 has no fork() primitive: a new process is created by
+  CreateProcess (or CreateProcessAsUser / CreateProcessWithToken).  Child
+  processes do not inherit the parent's address space, file descriptors,
+  or LockFileEx-held locks unless an inheritable handle is explicitly
+  propagated through STARTUPINFO and bInheritHandles.  The VMM opens
+  vmlock_fd as a non-inheritable handle, mirroring O_CLOEXEC on POSIX,
+  so the entirety of Section 7 (problems (a) and (b), the pthread_atfork
+  handler, INVALID_AFTER_FORK marking) is inapplicable on Windows.
+
+    No pthread_atfork registration:
+        Win32 has no pthread_atfork.  The LockProvider implementation on
+        Windows does not register any process-creation hook.
+
+    No inherited lock to release:
+        LockFileEx locks are tied to the file handle.  A child process
+        that does not inherit the parent's vmlock_fd holds no inherited
+        reference to the lock.  C-7's "inherited lock" condition cannot
+        arise.
+
+    Child opens are ordinary new mounts:
+        A child process that wants VMM access calls open() on the archive
+        independently.  This creates a new handle and acquires the lock
+        fresh, identical to any unrelated process opening the archive.
+
+  Spawn ordering is the application's responsibility on both platforms:
+  if a parent holds LOCK_EX and a child needs the lock, the parent must
+  release before the child acquires.  This constraint is identical on
+  Windows; only the failure mode of getting it wrong differs (POSIX:
+  child blocks indefinitely; Windows: child also blocks indefinitely on
+  LockFileEx without LOCKFILE_FAIL_IMMEDIATELY).
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

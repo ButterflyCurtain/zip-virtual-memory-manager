@@ -1763,6 +1763,21 @@
                             during index construction or read fails the
                             entry with ARCHIVE_MALFORMED (zip-bomb guard).
 
+  Strictness controls:
+
+    --strict-archive
+        Promotes diagnostics-only validation failures to ARCHIVE_MALFORMED
+        rejections.  Currently affects:
+          - Duplicate entry names (default: last-wins with a logged
+            diagnostic; --strict-archive: fail open() with
+            ARCHIVE_MALFORMED).
+        Intended for environments where lenient parsing of malformed
+        archives is itself a risk (audit pipelines, archive validators).
+        Lenient parsing remains the default because mainstream extractors
+        accept duplicates by last-wins convention, and rejecting them
+        diverges from observed real-world archives produced by buggy
+        writers.
+
   Entry names are opaque keys:
 
     The VMM never derives filesystem paths from entry names.  Names
@@ -1787,6 +1802,56 @@
       No state change.  The operation is rejected atomically; the mount
       remains in its prior state (except ESTALE and ARCHIVE_MALFORMED,
       whose state transitions are specified in their own sections).
+
+      Code-to-cause reference:
+
+        ENOENT                    operation on a path that does not exist
+                                  in the mount's current view (entry table
+                                  + Diff Layer overlay)
+
+        EEXIST                    create(path) where path already exists,
+                                  or rename(old,new) where new exists
+
+        EROFS                     write(), flush(), commit(), entry
+                                  operations issued on a read-only mount
+
+        EINVAL                    malformed caller arguments (offset past
+                                  ZIP64 bound, negative length, etc.)
+
+        ESTALE                    runtime fingerprint mismatch detected
+                                  on a Page Cache miss; see SNAPSHOT
+                                  CONSISTENCY for the per-mount-mode
+                                  semantics and post-detection state
+
+        LOCK_CONTENTION           --lock-nowait open() found the archive
+                                  exclusively held by another mount
+
+        COMMIT_IN_PROGRESS        commit(mode=SYNC) issued while a
+                                  background commit is active; see
+                                  BACKGROUND COMMIT
+
+        FORK_BOUNDARY_VIOLATION   any operation issued on a VmmMount
+                                  inherited across fork(); see Concurrent
+                                  Access Section 7
+
+        UNSUPPORTED_COMPRESSION   read() / write() of an entry whose ZIP
+                                  compression method has no registered
+                                  CompressionProvider; other entries in
+                                  the same archive remain accessible
+
+        ARCHIVE_MALFORMED         structural violation detected by the
+                                  parser (overlapping entries, oversized
+                                  declared sizes, NUL in entry name,
+                                  declared uncompressed size exceeded
+                                  during decode, compression ratio
+                                  beyond max_compression_ratio, or
+                                  duplicate names under --strict-archive).
+                                  Distinct from caller-error EINVAL:
+                                  ARCHIVE_MALFORMED is the archive's
+                                  problem, EINVAL is the caller's.
+
+      Implementations MAY surface these as Result-style enum variants
+      mapped to the codes above; the codes themselves are the contract.
 
   Class 2 — resource exhaustion:
 
