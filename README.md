@@ -66,7 +66,7 @@ docs/   設計仕様書 (ASCII アーキテクチャ図含む)
 ## 制作について
 
 AI 支援を利用（設計レビュー・文書整備・議論）。
-設計判断は @ButterflyCurtain によるものです。
+設計判断 @ButterflyCurtain 
 
 ## ライセンス
 
