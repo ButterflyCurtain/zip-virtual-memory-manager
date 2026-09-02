@@ -40,6 +40,28 @@
   with respect to concurrent readers, the FULL commit crash-safety
   argument must be re-validated for that platform.
 
+  Two further differences are not substitutions but constraints, and they
+  shape the procedures in this document rather than merely being renamed:
+
+    Mapped files.  On Windows a file that is currently mapped cannot be
+    truncated or overwritten in place.  Any procedure that modifies
+    archive.zip must therefore release its mapping first.  This includes
+    the INCREMENTAL path, which otherwise reads as "extends the archive
+    in-place; no temporary file or rename() is required" — true of the
+    file operations, but the mapping still has to go.  On POSIX releasing
+    it is an implementation choice; on Windows it is part of the
+    procedure.
+
+    Directory durability.  POSIX makes a rename() or unlink() durable by
+    fsync()ing the containing directory.  Windows has no equivalent for
+    directory entries.  Every argument here that depends on ordering two
+    directory operations — notably the deletion order in SIDECAR FILES /
+    Commit intent — therefore holds only where directory entries can be
+    made durable.  Where they cannot, the window such an argument closes
+    stays open, and the outcome degrades to the CONFLICT that the intent
+    record exists to avoid.  This is a real reduction in guarantee, not a
+    portability footnote.
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   LAYER OVERVIEW
@@ -551,13 +573,38 @@
 
       ZIP readers locate the authoritative EOCD by scanning backward from EOF
       for signature 0x504b0506 and validating the embedded CD offset and size
-      fields.  Therefore:
+      fields.
 
-        Crash before step 4 : no new EOCD is present; the original EOCD
-                              remains the last valid EOCD; the archive is
-                              unchanged from the caller's perspective.
         Crash after step 5  : the new EOCD is present; the archive reflects
                               the committed changes.
+        Crash before step 4 : no new EOCD is present.
+
+      It is tempting to conclude from the second case that the original EOCD
+      simply remains authoritative and the archive is unchanged from the
+      caller's perspective.  That does not survive contact with a conformant
+      reader, for two reasons:
+
+        A reader that validates the EOCD comment length — and it should,
+        since that is how the record's extent is defined — requires
+        eocd_offset + 22 + comment_len to equal the file size.  After a
+        partial append the original EOCD no longer satisfies this, because
+        bytes now follow it that its comment length does not account for.
+        Such a file is not "the old archive"; it is not a valid ZIP at all.
+
+        The backward scan is bounded.  A comment length is 16 bits, so a
+        reader need not look further back than 65 535 + 22 bytes from EOF.
+        Once the appended region grows past that — which an INCREMENTAL
+        commit of any substantial entry does immediately — the original
+        EOCD is outside the window of every conformant reader, whether or
+        not it checks comment lengths.
+
+      An interrupted INCREMENTAL commit therefore leaves a file that ZIP
+      tooling rejects, and recovery does not rest on the archive healing
+      itself.  It rests entirely on the commit intent: the record names the
+      length the archive had before the append, and the bytes below that
+      length were never rewritten, so truncating to it restores the previous
+      archive exactly.  See SIDECAR FILES / Commit intent, including the
+      requirement to verify that prefix before truncating anything.
 
     Disk requirement at commit time:
       sum of recompressed modified entry sizes only (reduced or eliminated

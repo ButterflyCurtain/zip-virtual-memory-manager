@@ -237,6 +237,15 @@
   are short in practice — EAGER: 1; LAZY: one per first-touched region
   batch; consolidation restores 1.
 
+  "Short in practice" is not a bound.  next_chunk_offset is read from the
+  file before the chunk it points at has been validated, so a corrupt or
+  hostile value can point backwards or at itself and the walk never ends.
+  Bound the traversal — the file size divided by the minimum chunk size is
+  an adequate and self-evident limit — and treat exceeding it as a decode
+  failure.  The index is a cache, so the response is the usual one: discard
+  and rebuild.  The point is that the reader must terminate, and it parses
+  the chain before it can trust any of it.
+
   Checkpoint record formats by provider:
 
     STORE         no checkpoints; chunk_head_offset = 0 permanently.
@@ -255,6 +264,17 @@
       window — the preceding *uncompressed* output, not compressed bytes — is
       loaded as the inflate dictionary ( inflateSetDictionary ).  This is the
       zlib zran restart procedure.
+
+      When recording compressed_offset while building checkpoints, do not
+      read it from the stream's total_in counter.  In zlib's ABI total_in
+      and total_out are declared unsigned long, which is 32 bits on Windows
+      ( LLP64 ) and 64 bits on LP64 platforms.  They wrap past 4 GiB on
+      Windows, silently, and produce checkpoint offsets that are wrong for
+      exactly the large entries this index exists to serve.  Track the
+      position from the caller's side instead — the bytes handed to the
+      decompressor minus the bytes it has not yet consumed ( avail_in ) —
+      which is exact on every platform.  avail_in is 32 bits everywhere, so
+      the input must be fed in bounded chunks regardless.
       When header flag WINDOWS_COMPRESSED is set, the window field is
       replaced by ( window_len : uint32, zlib_data : window_len bytes ),
       making the record variable-length; records remain individually

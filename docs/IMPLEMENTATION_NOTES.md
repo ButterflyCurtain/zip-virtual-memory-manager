@@ -210,6 +210,14 @@ work without it. Build it last, behind tests.
   still open cleanly in a stock extractor (Python `zipfile`, `unzip`, 7-Zip).
   Make that a property test driven by the fault injector — if it ever fails, a
   durability-ordering claim is wrong.
+  One exception, and it is deliberate: **mid-append during an INCREMENTAL
+  commit**. The file then carries bytes past an EOCD whose comment length does
+  not account for them, so a conformant reader rejects it — and once the
+  appended region exceeds ~64 KiB the original EOCD falls outside the backward
+  scan window entirely. Nothing heals that but the rollback. The invariant to
+  assert for those points is the one that actually holds: after the *next
+  open()*, `archive.zip` opens cleanly in a stock extractor. Recovery is part
+  of the guarantee, not something the guarantee is stated in spite of.
 - **Fuzz `open()` with malformed ZIPs.** The containment guarantees in UNTRUSTED
   ARCHIVES are only as good as the parser; a fuzzer over truncated, overlapping,
   and oversized-declaration inputs is the cheapest way to find the gaps.
