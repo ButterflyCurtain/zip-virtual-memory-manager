@@ -232,6 +232,51 @@
   vmdirty (see vmdirty Journal Specification, Section 1) and is
   recoverable under the same protocol as dirty pages.
 
+  The entry table
+
+    The seek index is immutable for the life of a mount and is keyed by the
+    names the archive actually contains.  Entry operations therefore cannot
+    edit it; they are expressed as an overlay on top of it, and that overlay
+    is the entry table.  Every read, write and commit path resolves a caller-
+    supplied path through this one function before doing anything else.
+
+    An entry in the table is in one of three states:
+
+        Created            the entry does not exist in the archive; it was
+                           created in this session.  It has no source: any
+                           page not written reads as zeros.
+
+        Tombstone          the entry exists in the archive but has been
+                           removed in this session.  It is absent from the
+                           effective set and omitted at commit.
+
+        Aliased{source}    the entry is visible under a name that the archive
+                           does not hold; `source` is the archive name whose
+                           data backs it.  Produced by rename().
+
+    A path not in the table resolves to the archive's own entry, if the seek
+    index has one, and to ENOENT otherwise.  The effective set of entries is
+
+        ( index ∪ Created ) − Tombstone
+
+    with Aliased members appearing under their current names.
+
+    Resolution yields two things the rest of the system needs: the *current*
+    name, which keys the Diff Layer and the journal, and the *source* name,
+    which keys the archive and the seek index.  For an ordinary entry the two
+    coincide.  For a Created entry there is no source.  For an Aliased entry
+    they differ, and conflating them is the mistake the third state exists to
+    prevent: a renamed entry must still be able to read its own unmodified
+    pages, and those live in the archive under the old name.
+
+    Why a third state is necessary:
+
+        Renaming is not "change the key".  The seek index cannot be re-keyed,
+        so an entry moved to a new name loses its route back to its own data
+        unless the mapping is recorded.  Two states — created and deleted —
+        can express remove-then-create, but that is a different operation:
+        it discards the entry's contents, whereas rename preserves them.
+
   Entry sizes:
 
     Every entry has a logical_size, initialised from the Central
@@ -272,6 +317,27 @@
     Tier 2 DATA RECORDs are superseded (they become dead records for
     journal compaction purposes).  The final partial page is zero-
     padded in its tail at commit.
+
+             Shrinking also lowers a second, separate bound: the highest
+             offset at which the *source archive* may still be consulted for
+             this entry — the source high-water mark.  It starts at the
+             entry's original uncompressed size and moves only downwards, to
+             min(high_water, new_size), for the life of the session.
+
+             Without it, truncate does not mean what it means on a
+             filesystem.  Consider truncate(f, 0) followed by a write far
+             past the new end.  The pages in between were never written, so
+             they are not in the Diff Layer, and a reader that falls through
+             to the archive for unwritten pages returns the *original* bytes
+             there: the data comes back from the dead.  With the mark at 0
+             the fall-through is disallowed and the gap reads as zeros,
+             which is what truncate promises.
+
+             The mark belongs to the session, not to the entry's current
+             size: re-extending does not raise it again.  It must therefore
+             survive recovery — see the vmdirty Journal Specification,
+             Section 2.
+
     Extend:  identical to implicit extension, recorded explicitly with
     a RESIZE METADATA RECORD because no DATA RECORD carries the extent.
 
@@ -286,7 +352,33 @@
   rename(old_path, new_path)
 
     Remaps the entry in the entry table.  Fails with ENOENT if old_path
-    does not exist, EEXIST if new_path does.  At INCREMENTAL commit a
+    does not exist, EEXIST if new_path does.
+
+    The remapping is expressed with the three states above:
+
+        new_path  becomes Aliased{source}, where source is the name under
+                  which the data sits in the archive — NOT necessarily
+                  old_path, see chain folding below.
+        old_path  becomes a Tombstone, so it stops resolving.
+
+        A Created entry that is renamed stays Created.  It has no source in
+        the archive, so there is nothing to alias to; only the name changes.
+
+    Chain folding:
+
+        rename(a, b) followed by rename(b, c) must leave c aliased to **a**,
+        the ultimate source, not to b.  b is a Tombstone by then and holds no
+        data; an alias pointing at it would dangle, and the entry would lose
+        the ability to read its own unmodified pages.  Aliases therefore
+        always name an entry that the archive actually contains.
+
+    Any state that keys off the entry — its dirty pages in the Diff Layer,
+    its spilled pages in the journal's index — is re-keyed from old_path to
+    new_path at the same time, so that a single lookup by current name keeps
+    working.  Nothing is rewritten on disk: the journal is append-only, and
+    recovery reproduces the same re-keying by replaying the RENAME record.
+
+    At INCREMENTAL commit a
     rename with no data change costs only a CD rewrite: the new CD
     entry carries the new name and the unchanged data offset.  The
     Local File Header retains the old name until the next FULL commit

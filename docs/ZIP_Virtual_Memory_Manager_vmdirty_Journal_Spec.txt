@@ -432,6 +432,32 @@
     that were never written are absent from the journal and read as
     zeros.
 
+    base for a renamed entry:
+
+      An entry that a RENAME has moved is not in the Central Directory
+      under its current name — the archive still holds it under the old
+      one.  Its base is the uncompressed_size of its *source* entry,
+      found by following the alias produced by the replayed RENAME.
+      Looking up the current name yields nothing and would silently
+      start the entry at zero.
+
+    Recovering the source high-water mark:
+
+      truncate() carries two effects: it sets logical_size, and it lowers
+      the bound below which the source archive may still be read for that
+      entry ( see the main architecture document, ENTRY OPERATIONS /
+      truncate ).  A RESIZE record carries one number and so can express
+      only the first.  Recovery must nevertheless restore both, or a
+      shrink followed by a re-extension resurrects the truncated tail
+      after a crash — the very thing the high-water mark prevents.
+
+      Encode the pair as two RESIZE records in sequence: the shrink to
+      the low mark, then the growth to the final logical size.  Replay
+      applies them in order, so the mark is driven down by the first and
+      the size restored by the second, and the one-dimensional record
+      format is enough.  A session whose high-water mark equals its
+      logical size emits a single RESIZE as before.
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   SECTION 3 : Recovery Protocol — Caller API and Decision Tree
@@ -745,6 +771,30 @@
         Only when there is no usable intent, or the live archive matches
         neither of the fingerprints it records, is this a CONFLICT state that
         the caller must resolve.
+
+  Re-journalling a recovered session:
+
+    Recovery does not end with state in memory.  The recovered session
+    continues in a new generation, and its state has to be written into the
+    new journal so that a second crash is survivable.  This is not a copy of
+    the old journal: it is a fresh, equivalent sequence of records that
+    reproduces the same state.  Two rules constrain it, and both are easy to
+    get wrong.
+
+    RENAME comes first.  For an entry whose current name differs from its
+    source, the RENAME must be emitted before any RESIZE or DATA RECORD that
+    refers to it.  Records name entries by their current name; replayed
+    against a journal in which the rename has not yet happened, they would
+    apply to an entry that does not exist.
+
+    The rename's origin gets no REMOVE.  A rename leaves the old name as a
+    tombstone, and it is tempting to re-emit that tombstone as a REMOVE.  Do
+    not.  Replay would delete the source entry, and the RENAME would then have
+    nothing to alias to — the entry's unmodified pages become unreachable.
+    Encoding a rename as REMOVE(old) + CREATE(new) fails the same way, and
+    worse: CREATE means "empty", so after two crashes the entry is silently
+    an empty file.  The tombstone is implied by the RENAME and must be left
+    implicit.
 
   Recovery and session transition:
 
