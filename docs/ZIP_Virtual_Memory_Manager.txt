@@ -319,6 +319,24 @@
        │       bloat exceeds threshold →  FULL (compaction) path
        │       force_compact = true    →  FULL (compaction) path
        │
+       ├─ Build the result in memory, then WRITE THE COMMIT INTENT
+       │  ( see SIDECAR FILES / Commit intent ):
+       │       Record the archive fingerprint as it is now, the
+       │       fingerprint it will have once this commit completes, and
+       │       which path is being taken.  The post-commit fingerprint is
+       │       computable before any write: the FULL path has the new
+       │       archive in memory, and the INCREMENTAL path has the new
+       │       Central Directory inside the region it is about to append.
+       │       fdatasync() the intent file, then fsync() the sidecar
+       │       directory.  ONLY THEN may archive.zip be touched.
+       │
+       │       This barrier is what makes the commit window decidable.
+       │       A successful commit changes file_size, inode and cd_hash —
+       │       exactly as an external replacement would.  Without a record
+       │       of the intended outcome, a recovering open() cannot tell
+       │       "my own commit succeeded" from "someone else replaced the
+       │       archive", and must fall back to CONFLICT.
+       │
        ├─ [INCREMENTAL path]
        │       For each modified entry:
        │           recompress entry only  ( cost ∝ that entry, not whole archive )
@@ -362,13 +380,33 @@
        │           Crash before rename : source ZIP survives intact
        │           Crash after  rename : new ZIP is complete and valid
        │
-       ├─ Update archive.zip.vmm/vmidx for modified entries only, and refresh
-       │  the vmidx header fingerprint ( file_size, inode, mtime_ns,
-       │  cd_hash ).  The FULL path replaces the archive inode via
-       │  rename(); without the refresh, the next open() would
-       │  invalidate the entire index.
+       ├─ Update archive.zip.vmm/vmidx.  What is possible depends on the
+       │  path taken, and the two differ fundamentally:
        │
-       └─ Delete archive.zip.vmm/vmdirty
+       │      [INCREMENTAL path]
+       │          Unmodified entries keep their local header offsets — that
+       │          is the defining property of an append-only commit — so the
+       │          index may be extended with the appended entries and the
+       │          header fingerprint ( file_size, inode, mtime_ns, cd_hash )
+       │          refreshed.  Without the refresh the next open() would
+       │          rebuild the whole index for no reason.
+       │
+       │      [FULL (compaction) path]
+       │          Every entry is laid out afresh, so every local header
+       │          offset moves — including those of entries with no modified
+       │          pages, because an entry earlier in the archive may have
+       │          changed size.  Updating "modified entries only" and
+       │          refreshing the fingerprint would therefore produce an index
+       │          that CLAIMS to match the new archive while pointing at
+       │          stale offsets, and reads through it would return garbage.
+       │          Leave the index stale.  The fingerprint mismatch at the
+       │          next open() is the correct outcome: vmidx is a cache, and
+       │          the response to a failed validation is always to discard
+       │          and rebuild.
+       │
+       └─ Delete archive.zip.vmm/vmdirty, then delete the commit intent.
+          The intent MUST be deleted last, and its deletion must be ordered
+          after the journal's: see SIDECAR FILES / Commit intent.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -450,8 +488,13 @@
       3. rename( archive.new.zip → archive.zip )   ← POSIX atomic.
 
     Crash before rename : archive.zip is unchanged; archive.new.zip is
-                          cleaned up at next open().
-    Crash after  rename : archive.zip is complete and minimal.
+                          cleaned up at next open().  commit.intent matches
+                          the pre-commit fingerprint, so any vmdirty is
+                          recovered normally.
+    Crash after  rename : archive.zip is complete and minimal.  commit.intent
+                          matches the post-commit fingerprint, so a vmdirty
+                          that outlived the rename is discarded rather than
+                          replayed ( see SIDECAR FILES / Commit intent ).
 
     Disk requirement at commit time: current total archive size (for
     archive.new.zip while it is being written).
@@ -814,10 +857,18 @@
     Crash after RENAME, before vmdirty deletion:
         archive.zip is the compacted file containing S ∪ D (applied in
         MERGE).  vmdirty may still be present.  Recovery at next open()
-        applies vmdirty pages to the compacted archive.zip.  This is
-        correct: FULL compaction does not alter logical content; any
-        dirty page from S or D that was already committed to archive.zip
-        results in an idempotent overwrite with the same data.
+        reads commit.intent, sees that the live archive matches the
+        recorded post-commit fingerprint, and therefore knows the commit
+        completed: the surviving vmdirty is stale and is discarded without
+        being replayed.
+
+        Do not replay it.  An earlier revision of this document argued that
+        replaying was safe because compaction preserves logical content and
+        the pages would be overwritten with identical data.  That argument
+        covers DATA RECORDs only.  A journal also carries METADATA RECORDs,
+        and CREATE / REMOVE / RENAME / RESIZE are not idempotent against an
+        archive in which they have already been applied — a RENAME replayed
+        onto the renamed result has no source entry left to find.
 
     In all crash cases: archive.zip is never left in a partially-written
     state.  Either the original archive survives or the fully compacted
@@ -2081,6 +2132,9 @@
       vmdirty                  spill journal (present only during dirty session)
       vmdirty.bak.{id}         recovered spill journal (retained for forensics)
       vmdirty.compact          journal compaction scratch file (transient)
+      commit.intent            write-ahead record of a commit in progress
+                               (present only between the start and the end
+                               of a commit)
     archive.new.zip            commit scratch file (transient; FULL path
                                only).  Kept beside archive.zip, not inside
                                the sidecar directory, because it replaces
@@ -2094,6 +2148,88 @@
     progress (synchronous or background).  A file found at this path at open()
     time with no active mount is an orphan from an interrupted full commit
     and is removed silently.
+
+  Commit intent
+
+    commit.intent is a write-ahead record: it states what the archive looks
+    like now and what it will look like once the commit completes.  It is
+    written and made durable BEFORE archive.zip is modified, and deleted
+    after the commit is finished.
+
+    Why it is necessary:
+
+        A successful commit changes the archive's file_size, inode and
+        cd_hash.  So does an external process replacing the archive.  The
+        two are indistinguishable after the fact.  A recovering open() that
+        finds a surviving vmdirty next to a changed archive therefore cannot
+        decide, on fingerprint evidence alone, whether its own commit
+        succeeded or whether someone else overwrote the file — and the safe
+        fallback, CONFLICT, forces a question onto the caller that the
+        caller has no way to answer either.
+
+        Ordering cannot solve this.  Deleting the journal before replacing
+        the archive loses the dirty pages if the crash lands in between;
+        renaming the journal aside first loses the whole dirty session the
+        same way.  Two independent objects must change together, and the
+        only way to make the window between them decidable is to record the
+        intended outcome first.
+
+    Record contents:
+
+        magic                    identifies the file
+        version                  record format version
+        mode                     FULL | INCREMENTAL
+        pre_size, pre_cd_hash    the archive as it is before the commit
+        post_size, post_cd_hash  the archive as it will be after it
+        crc32c                   over all preceding bytes
+
+        inode is deliberately absent.  It is not portable ( see PLATFORM
+        ASSUMPTIONS ), and file_size together with cd_hash identifies the
+        archive well enough for this decision.
+
+        For the INCREMENTAL path pre_size doubles as the rollback target:
+        the bytes below it are never rewritten, so truncating to pre_size
+        restores the previous archive exactly.
+
+    Use at open():
+
+        Compare the live archive against the record.
+
+        matches post_*  → the commit completed.  Any surviving vmdirty
+                          belongs to the state already folded into the
+                          archive; discard it without replaying and mount
+                          CLEAN.  No question is put to the caller.
+
+        matches pre_*   → the commit never reached the archive.  Nothing to
+                          roll back ( an orphaned archive.new.zip is removed
+                          by the rule above ).  Recover from vmdirty
+                          normally.
+
+        neither         → INCREMENTAL: the append was interrupted.  Verify
+                          that the first pre_size bytes are themselves the
+                          pre_* archive, and only then truncate to pre_size.
+                          Truncating without that check would destroy an
+                          unrelated archive that happens to sit at the path.
+                          FULL: the archive was replaced by something this
+                          mount did not write.  Touch nothing; this is a
+                          genuine CONFLICT.
+
+        A record that is absent, short, of an unknown version, or whose
+        crc32c does not verify is treated as absent: the intent was not made
+        durable, so the archive was never touched.
+
+    Deletion order:
+
+        On success, delete vmdirty first, make that deletion durable, and
+        only then delete commit.intent.  If the two deletions are merely
+        issued and covered by one directory fsync, a filesystem is free to
+        make them durable in either order, and the state "new archive +
+        surviving vmdirty + no intent" becomes observable — which is exactly
+        the undecidable state the intent exists to prevent.
+
+        This ordering guarantee costs one extra directory fsync and holds
+        only on platforms where directory entries can be made durable; see
+        PLATFORM ASSUMPTIONS.
 
   Directory creation and durability
 

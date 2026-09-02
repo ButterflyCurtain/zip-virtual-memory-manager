@@ -493,6 +493,18 @@
        │
        └─ vmdirty present
                │
+               ├─ commit intent present and valid?  ( see main architecture
+               │   document, SIDECAR FILES / Commit intent )
+               │       archive matches post_* → this mount's own commit
+               │               completed; the journal is stale
+               │               → discard() silently, mount CLEAN
+               │       archive matches pre_*  → the commit never reached the
+               │               archive; fall through to the fingerprint check,
+               │               which will match
+               │       neither                → fall through; the fingerprint
+               │               check will report CONFLICT
+               │       ( no intent )          → fall through
+               │
                ├─ fingerprint check: source ZIP changed while dirty pages exist?
                │       YES → CONFLICT state
                │               offer: discard() | abort()
@@ -721,8 +733,18 @@
         The generation_id identifies which prior session.  Proceed with
         the recovery protocol.
 
-    Fingerprint mismatches → vmdirty is stale (source changed).
-        CONFLICT state.  Caller must resolve.
+    Fingerprint mismatches → the archive is not the one this journal was
+        recorded against.  Consult commit.intent before concluding anything:
+        a successful commit by this very mount changes all three components
+        exactly as an external replacement does.
+
+        If the intent records the live archive as its post-commit state, the
+        journal is stale in the benign sense — the work it describes is
+        already in the archive — and it is discarded without replay.
+
+        Only when there is no usable intent, or the live archive matches
+        neither of the fingerprints it records, is this a CONFLICT state that
+        the caller must resolve.
 
   Recovery and session transition:
 
